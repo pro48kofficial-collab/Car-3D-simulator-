@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#101418" />
+  <title>Project Drive — Prototype</title>
+</head>
+<body>
+  <div id="game"></div>
+  <div id="loading">PROJECT DRIVE<br><small>Завантаження світу…</small></div>
+
+  <div id="hud">
+    <div class="topline">
+      <div class="brand">PROJECT <b>DRIVE</b></div>
+      <div class="status">FREE ROAM · PROTOTYPE</div>
+    </div>
+    <div class="speedbox">
+      <div id="speed">0</div>
+      <span>KM/H</span>
+      <div id="gear">D</div>
+    </div>
+    <div class="hint" id="hint">WASD / стрілки — керування · C — камера</div>
+    <button id="cameraBtn" class="camera">КАМЕРА</button>
+    <div class="touch-controls">
+      <div class="steering">
+        <button data-key="ArrowLeft">◀</button>
+        <button data-key="ArrowRight">▶</button>
+      </div>
+      <div class="pedals">
+        <button data-key="Space" class="brake">ГАЛЬМО</button>
+        <button data-key="ArrowUp" class="gas">ГАЗ</button>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
