@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#101418" />
+  <title>Project Drive — Prototype</title>
+</head>
+<body>
+  <div id="game"></div>
+  <div id="loading">PROJECT DRIVE<br><small>Завантаження світу…</small></div>
+
+  <div id="hud">
+    <div class="topline">
+      <div class="brand">PROJECT <b>DRIVE</b></div>
+      <div class="status">FREE ROAM · JEEP</div>
+    </div>
+    <div class="speedbox">
+      <div id="speed">0</div>
+      <span>KM/H</span>
+      <div id="gear">N</div>
+    </div>
+    <div class="hint" id="hint">W/S — газ / задній · Space — гальмо · A/D — руль · C — камера<br>або крутіть руль на екрані</div>
+    <button id="cameraBtn" class="camera">КАМЕРА</button>
+
+    <div id="wheel" aria-label="Руль">
+      <svg viewBox="-50 -50 100 100">
+        <circle r="43" fill="none" stroke="#ffffff55" stroke-width="12"/>
+        <circle r="43" fill="none" stroke="#161b20" stroke-width="9"/>
+        <line x1="-43" y1="0" x2="43" y2="0" stroke="#161b20" stroke-width="7"/>
+        <line x1="0" y1="0" x2="0" y2="43" stroke="#161b20" stroke-width="7"/>
+        <circle r="10" fill="#161b20" stroke="#ffffff55" stroke-width="1.5"/>
+        <line x1="0" y1="-47" x2="0" y2="-39" stroke="#b8ff3d" stroke-width="3.5"/>
+      </svg>
+    </div>
+
+    <div class="pedals">
+      <button data-key="ArrowDown" class="rev">R</button>
+      <button data-key="Space" class="brake">ГАЛЬМО</button>
+      <button data-key="ArrowUp" class="gas">ГАЗ</button>
+    </div>
+  </div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

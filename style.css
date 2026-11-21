@@ -1,1 +1,79 @@
-*{box-sizing:border-box}html,body,#game{margin:0;width:100%;height:100%;overflow:hidden;background:#9eb4c3;font-family:Arial,sans-serif;touch-action:none}canvas{display:block;width:100%;height:100%}#hud{position:fixed;inset:0;pointer-events:none;color:#fff}.topline{position:absolute;top:16px;left:18px;right:18px;display:flex;justify-content:space-between;align-items:center;text-shadow:0 2px 8px #000}.brand{font-size:17px;letter-spacing:3px;font-weight:700}.brand b{color:#b8ff3d}.status{font-size:10px;letter-spacing:1.5px;color:#e4e9ed}.speedbox{position:absolute;right:20px;bottom:22px;width:112px;height:92px;background:#101820d9;border:1px solid #ffffff30;border-radius:14px;padding:9px 12px;text-align:right;box-shadow:0 8px 28px #0005}.speedbox #speed{font-size:42px;font-weight:800;line-height:43px;font-variant-numeric:tabular-nums}.speedbox span{font-size:10px;letter-spacing:2px;color:#b8ff3d}.speedbox #gear{position:absolute;left:13px;bottom:12px;font-size:17px;font-weight:bold}.hint{position:absolute;left:18px;bottom:22px;background:#101820b8;padding:9px 12px;border-radius:8px;font-size:11px;color:#e7edf1}.camera{pointer-events:auto;position:absolute;right:20px;top:64px;border:1px solid #ffffff50;border-radius:9px;background:#101820c9;color:white;padding:10px 13px;font-weight:bold;font-size:11px}.touch-controls{display:none;position:absolute;left:14px;right:145px;bottom:18px;justify-content:space-between;align-items:end;pointer-events:auto}.touch-controls button{width:58px;height:58px;border:1px solid #ffffff70;border-radius:15px;background:#101820bb;color:white;font-weight:bold;font-size:19px;touch-action:none}.steering,.pedals{display:flex;gap:9px}.touch-controls .gas{background:#8abf24dd;color:#101820}.touch-controls .brake{font-size:10px;background:#b13c39dd}@media(max-width:800px),(pointer:coarse){.touch-controls{display:flex}.hint{display:none}.speedbox{bottom:98px}.camera{top:62px}}#loading{position:fixed;z-index:5;inset:0;display:grid;place-content:center;text-align:center;background:#101418;color:#b8ff3d;font-weight:900;letter-spacing:5px;font-size:24px;transition:opacity .5s}#loading small{margin-top:12px;color:#d4dadd;font-size:11px;letter-spacing:2px;font-weight:400}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body, #game {
+  margin: 0; width: 100%; height: 100%; overflow: hidden;
+  background: #9eb4c3; font-family: Arial, sans-serif; touch-action: none;
+  user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+canvas { display: block; width: 100%; height: 100%; }
+
+#hud { position: fixed; inset: 0; pointer-events: none; color: #fff; }
+
+.topline {
+  position: absolute; top: 16px; left: 18px; right: 18px;
+  display: flex; justify-content: space-between; align-items: center;
+  text-shadow: 0 2px 8px #000;
+}
+.brand { font-size: 17px; letter-spacing: 3px; font-weight: 700; }
+.brand b { color: #b8ff3d; }
+.status { font-size: 10px; letter-spacing: 1.5px; color: #e4e9ed; }
+
+/* спідометр — по центру внизу */
+.speedbox {
+  position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%);
+  width: 112px; height: 92px; background: #101820d9; border: 1px solid #ffffff30;
+  border-radius: 14px; padding: 9px 12px; text-align: right; box-shadow: 0 8px 28px #0005;
+}
+.speedbox #speed { font-size: 42px; font-weight: 800; line-height: 43px; font-variant-numeric: tabular-nums; }
+.speedbox span { font-size: 10px; letter-spacing: 2px; color: #b8ff3d; }
+.speedbox #gear { position: absolute; left: 13px; bottom: 12px; font-size: 17px; font-weight: bold; }
+
+.hint {
+  position: absolute; left: 18px; top: 50px; background: #101820b8; padding: 9px 12px;
+  border-radius: 8px; font-size: 11px; line-height: 1.5; color: #e7edf1;
+}
+.camera {
+  pointer-events: auto; position: absolute; right: 20px; top: 54px;
+  border: 1px solid #ffffff50; border-radius: 9px; background: #101820c9; color: #fff;
+  padding: 10px 13px; font-weight: bold; font-size: 11px;
+}
+
+/* екранний руль */
+#wheel {
+  position: absolute; left: 16px; bottom: 18px; width: 150px; height: 150px;
+  pointer-events: auto; touch-action: none; cursor: grab;
+  filter: drop-shadow(0 6px 14px #0008);
+  will-change: transform;
+}
+#wheel svg { width: 100%; height: 100%; display: block; pointer-events: none; }
+
+/* педалі */
+.pedals {
+  position: absolute; right: 16px; bottom: 18px; display: flex; gap: 10px; align-items: flex-end;
+  pointer-events: auto;
+}
+.pedals button {
+  border: 1px solid #ffffff70; border-radius: 16px; background: #101820bb; color: #fff;
+  font-weight: bold; font-size: 12px; letter-spacing: 1px; touch-action: none;
+  transition: transform .06s, filter .06s;
+}
+.pedals button.pressed { transform: scale(.94); filter: brightness(1.35); }
+.pedals .rev { width: 50px; height: 50px; font-size: 18px; }
+.pedals .brake { width: 78px; height: 88px; background: #b13c39dd; }
+.pedals .gas { width: 86px; height: 128px; background: #8abf24dd; color: #101820; font-size: 14px; }
+
+@media (max-width: 800px), (pointer: coarse) {
+  .hint { display: none; }
+  #wheel { width: 132px; height: 132px; }
+  .pedals .gas { width: 76px; height: 116px; }
+  .pedals .brake { width: 66px; height: 80px; font-size: 10px; }
+  .pedals .rev { width: 44px; height: 44px; }
+  .speedbox { width: 96px; height: 82px; bottom: 18px; }
+  .speedbox #speed { font-size: 36px; line-height: 38px; }
+}
+
+#loading {
+  position: fixed; z-index: 5; inset: 0; display: grid; place-content: center; text-align: center;
+  background: #101418; color: #b8ff3d; font-weight: 900; letter-spacing: 5px; font-size: 24px;
+  transition: opacity .5s;
+}
+#loading small { margin-top: 12px; color: #d4dadd; font-size: 11px; letter-spacing: 2px; font-weight: 400; }
