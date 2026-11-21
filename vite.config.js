@@ -1,10 +1,8 @@
+import { defineConfig } from 'vite';
 
-import { defineConfig } from 'vite'
-
+// base './' — щоб гра працювала з файлів усередині APK, без сервера
 export default defineConfig({
-  preview: {
-    allowedHosts: [
-      'car-3d-simulator.onrender.com'
-    ]
-  }
-})
+  base: './',
+  build: { chunkSizeWarningLimit: 2000 }
+});
+  
