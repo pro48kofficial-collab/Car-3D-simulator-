@@ -1,1 +1,465 @@
+import * as THREE from 'three';
+import RAPIER from '@dimforge/rapier3d-compat';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import './style.css';
 
+const game = document.querySelector('#game');
+const loading = document.querySelector('#loading');
+const speedEl = document.querySelector('#speed');
+const gearEl = document.querySelector('#gear');
+const wheelEl = document.querySelector('#wheel');
+const cameraBtn = document.querySelector('#cameraBtn');
+const qualityBtn = document.querySelector('#qualityBtn');
+const statusEl = document.querySelector('.status');
+
+const V3 = THREE.Vector3;
+const Y_AXIS = new V3(0, 1, 0);
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const mix = (a, b, t) => a + (b - a) * t;
+
+// ================================================================ якість графіки
+const QUALITY = {
+  high: { label: 'ВИСОКА', pr: 2, shadow: 4096, snow: 9000, trees: 1.0, animals: 1.0, castTrees: true },
+  mid:  { label: 'СЕРЕДНЯ', pr: 1.5, shadow: 2048, snow: 4500, trees: 0.5, animals: 0.7, castTrees: false },
+  low:  { label: 'НИЗЬКА', pr: 1, shadow: 1024, snow: 1800, trees: 0.2, animals: 0.4, castTrees: false }
+};
+let qualityKey = 'high';
+try { const s = localStorage.getItem('pd_quality'); if (QUALITY[s]) qualityKey = s; } catch (e) { /* ignore */ }
+
+// ================================================================ рендерер, сцена
+const HORIZON = new THREE.Color(0xc9dbe6);
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(HORIZON, 140, 800);
+
+const camera = new THREE.PerspectiveCamera(65, innerWidth / innerHeight, 0.05, 1500);
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setClearColor(0x9fb8c9);
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+game.appendChild(renderer.domElement);
+const maxAniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.5;
+
+const hemi = new THREE.HemisphereLight(0xdcecff, 0x66705b, 1.3);
+scene.add(hemi);
+const SUN_DIR = new V3(-65, 100, 45).normalize();
+const sun = new THREE.DirectionalLight(0xfff0d5, 3.0);
+sun.castShadow = true;
+sun.shadow.camera.left = -70; sun.shadow.camera.right = 70;
+sun.shadow.camera.top = 70; sun.shadow.camera.bottom = -70;
+sun.shadow.camera.near = 10; sun.shadow.camera.far = 400;
+sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.05;
+scene.add(sun); scene.add(sun.target);
+
+// небо: градієнт + сонце, зливається з туманом
+const skyUniforms = {
+  uTop: { value: new THREE.Color(0x4f86c6) },
+  uHorizon: { value: scene.fog.color },
+  uSunDir: { value: SUN_DIR.clone() }
+};
+const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(1200, 32, 16),
+  new THREE.ShaderMaterial({
+    side: THREE.BackSide, depthWrite: false, depthTest: false, fog: false,
+    uniforms: skyUniforms,
+    vertexShader: `varying vec3 vDir; void main(){ vDir = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+    fragmentShader: `
+      uniform vec3 uTop; uniform vec3 uHorizon; uniform vec3 uSunDir; varying vec3 vDir;
+      void main(){
+        vec3 d = normalize(vDir);
+        float h = clamp(d.y, 0.0, 1.0);
+        vec3 col = mix(uHorizon, uTop, pow(h, 0.5));
+        float s = max(dot(d, normalize(uSunDir)), 0.0);
+        col += vec3(1.0, 0.93, 0.75) * (pow(s, 900.0) * 3.0 + pow(s, 14.0) * 0.18);
+        gl_FragColor = vec4(col, 1.0);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }`
+  })
+);
+sky.renderOrder = -10; sky.frustumCulled = false;
+scene.add(sky);
+
+const mat = (color, roughness = 0.8, metalness = 0) => new THREE.MeshStandardMaterial({ color, roughness, metalness });
+const whiteMat = mat(0xe9e8df);
+const glassMat = new THREE.MeshStandardMaterial({ color: 0x18303b, roughness: 0.2, metalness: 0.25 });
+
+function box(parent, w, h, d, material, x, y, z, cast = true) {
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
+  mesh.position.set(x, y, z); mesh.castShadow = cast; mesh.receiveShadow = true;
+  parent.add(mesh); return mesh;
+}
+function bar(parent, a, b, r, material, seg = 8) {
+  const d = new V3().subVectors(b, a);
+  const len = d.length();
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, seg), material);
+  m.position.copy(a).addScaledVector(d, 0.5);
+  m.quaternion.setFromUnitVectors(Y_AXIS, d.normalize());
+  m.castShadow = true;
+  parent.add(m); return m;
+}
+function scaleUV(geo, su, sv) {
+  const uv = geo.attributes.uv;
+  for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * su, uv.getY(i) * sv);
+  uv.needsUpdate = true;
+}
+function canvasTex(size, draw, srgb = true) {
+  const c = document.createElement('canvas'); c.width = c.height = size;
+  draw(c.getContext('2d'), size);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = maxAniso;
+  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+// ================================================================ шум і висота рельєфу
+function hash2(x, z) {
+  let h = (Math.imul(x, 374761393) + Math.imul(z, 668265263)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+function vnoise(x, z) {
+  const xi = Math.floor(x), zi = Math.floor(z), xf = x - xi, zf = z - zi;
+  const u = xf * xf * (3 - 2 * xf), v = zf * zf * (3 - 2 * zf);
+  const a = hash2(xi, zi), b = hash2(xi + 1, zi), c = hash2(xi, zi + 1), d = hash2(xi + 1, zi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function fbm(x, z, oct = 5) {
+  let s = 0, a = 0.5, f = 1, n = 0;
+  for (let i = 0; i < oct; i++) { s += a * vnoise(x * f, z * f); n += a; a *= 0.5; f *= 2.03; }
+  return s / n;
+}
+function mulberry(seed) {
+  let a = seed >>> 0;
+  return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+
+const WORLD_HALF = 700;
+const ROAD_LINES = [-90, -30, 30, 90];
+const CITY_HALF = 180;
+const MEADOWS = [
+  { x: 0, z: 0, r: 18, flat: true },
+  { x: -235, z: 70, r: 50 },
+  { x: 240, z: -80, r: 50 },
+  { x: 175, z: -310, r: 55 },
+  { x: -120, z: -330, r: 55 },
+  { x: 50, z: 260, r: 50 },
+  { x: -250, z: -130, r: 50 }
+];
+// гірська дорога на північ від міста: x = 30 + 28·sin(s/70), де s = -z - 180
+const pathX = s => 30 + 28 * Math.sin(Math.max(s, 0) / 70);
+
+function snowMask(x, z, h) { return smooth(52, 72, h + (vnoise(x / 35, z / 35) - 0.5) * 20); }
+
+function baseH(x, z) {
+  const d = Math.max(Math.abs(x), Math.abs(z));
+  if (d < 185) return 0;
+  const r = fbm(x / 260 + 11.3, z / 260 - 4.1, 5);
+  const ridge = 1 - Math.abs(2 * fbm(x / 320 + 3.7, z / 320 + 9.1, 4) - 1);
+  const base = Math.pow(0.55 * r + 0.45 * ridge, 1.6);
+  const ramp = smooth(185, 330, d);
+  const north = 1 + 0.5 * clamp(-z / 500, 0, 1);
+  let h = 150 * base * ramp * north;
+  for (const m of MEADOWS) {
+    if (m.flat) continue;
+    const dm = Math.hypot(x - m.x, z - m.z);
+    if (dm < m.r + 90) h *= smooth(m.r, m.r + 90, dm);
+  }
+  const s = -z - 180;
+  if (s > 0 && s < 540) {
+    const lateral = Math.abs(x - pathX(s));
+    const pathH = 0.19 * s;
+    h = mix(pathH, h, smooth(12, 60, lateral));
+  }
+  return h;
+}
+
+// ================================================================ озера і річки (дані)
+const LAKES = [
+  { x: -275, z: 255, r: 80, shore: 70, depth: 7, beach: true },   // пляжне озеро біля міста
+  { x: -390, z: -20, r: 60, shore: 60, depth: 9 },
+  { x: -250, z: -450, r: 50, shore: 60, depth: 9 }                 // високогірне озеро — джерело річки
+];
+for (const l of LAKES) {
+  let m = Infinity;
+  for (let k = 0; k < 24; k++) {
+    const a = k / 24 * Math.PI * 2, R = l.r + l.shore * 0.8;
+    m = Math.min(m, baseH(l.x + Math.cos(a) * R, l.z + Math.sin(a) * R));
+  }
+  l.level = Math.max(m - 0.3, -0.3);
+}
+function insideLake(x, z, m = 0) {
+  for (const l of LAKES) if (Math.hypot(x - l.x, z - l.z) < l.r + m) return true;
+  return false;
+}
+function lakeAdjust(h, x, z) {
+  const w = smooth(185, 200, Math.max(Math.abs(x), Math.abs(z)));
+  if (w <= 0) return h;
+  let out = h;
+  for (const l of LAKES) {
+    const dd = Math.hypot(x - l.x, z - l.z);
+    if (dd >= l.r + l.shore) continue;
+    if (dd < l.r) out = l.level - l.depth * smooth(1, 0.35, dd / l.r);
+    else out = mix(l.level + (dd - l.r) * (l.beach ? 0.055 : 0.12), out, smooth(l.r + 20, l.r + l.shore, dd));
+  }
+  return mix(h, out, w);
+}
+const hLake = (x, z) => lakeAdjust(baseH(x, z), x, z);
+
+const RIVER_HALF = 6, RIVER_DEPTH = 1.6;
+function makeRiverData(a, b, amp, phase, dropFrac, dropH) {
+  const dx = b.x - a.x, dz = b.z - a.z, len = Math.hypot(dx, dz);
+  const ux = dx / len, uz = dz / len, px = -uz, pz = ux;
+  const start = a.r * 0.5, end = len - b.r * 0.7;
+  const n = Math.round((end - start) / 20);
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const t = i / n, s = start + (end - start) * t;
+    const off = amp * Math.sin(t * Math.PI * 3 + phase) * Math.sin(t * Math.PI);
+    pts.push({ x: a.x + ux * s + px * off, z: a.z + uz * s + pz * off, S: 0 });
+  }
+  let kw = -1;
+  if (dropFrac) {                      // коротка ділянка 5 м, на якій вода падає
+    kw = Math.round(n * dropFrac);
+    const p0 = pts[kw - 1], p1 = pts[kw];
+    const l = Math.hypot(p1.x - p0.x, p1.z - p0.z);
+    pts.splice(kw, 0, { x: p0.x + (p1.x - p0.x) / l * 5, z: p0.z + (p1.z - p0.z) / l * 5, S: 0 });
+  }
+  for (let pass = 0; pass < 4; pass++) {
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i], hh = hLake(p.x, p.z);
+      const inA = Math.hypot(p.x - a.x, p.z - a.z) < a.r;
+      const db = Math.hypot(p.x - b.x, p.z - b.z);
+      let s;
+      if (i === 0 || inA) s = a.level;
+      else if (db < b.r) s = b.level;
+      else {
+        s = Math.min(pts[i - 1].S - 0.03, hh - 0.6);
+        if (i === kw) s = Math.min(pts[i - 1].S - dropH, hh - 0.6);
+      }
+      p.S = s;
+    }
+    // озеро-приймач не може бути вищим за річку, що в нього впадає
+    let m = pts.length - 1;
+    while (m > 0 && Math.hypot(pts[m].x - b.x, pts[m].z - b.z) < b.r) m--;
+    if (!b.beach) b.level = Math.min(b.level, pts[m].S - 0.05);
+  }
+  const segs = [];
+  let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i];
+    x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x); z0 = Math.min(z0, p.z); z1 = Math.max(z1, p.z);
+    if (i < pts.length - 1) {
+      const q = pts[i + 1];
+      segs.push({ ax: p.x, az: p.z, bx: q.x, bz: q.z, sa: p.S, sb: q.S, l2: (q.x - p.x) ** 2 + (q.z - p.z) ** 2 });
+    }
+  }
+  return { pts, segs, kw, x0: x0 - 75, x1: x1 + 75, z0: z0 - 75, z1: z1 + 75 };
+}
+const RIVERS = [
+  makeRiverData(LAKES[2], LAKES[1], 22, 0.6, 0.55, 16),   // з озера в горах — з водоспадом
+  makeRiverData(LAKES[1], LAKES[0], 18, 2.1, 0, 0)         // до пляжного озера
+];
+
+let _rqD = 0, _rqS = 0;
+function riverQuery(rv, x, z) {
+  let best = Infinity, bs = 0;
+  for (let i = 0; i < rv.segs.length; i++) {
+    const g = rv.segs[i];
+    const vx = g.bx - g.ax, vz = g.bz - g.az;
+    let u = ((x - g.ax) * vx + (z - g.az) * vz) / g.l2;
+    u = u < 0 ? 0 : u > 1 ? 1 : u;
+    const qx = g.ax + vx * u - x, qz = g.az + vz * u - z, d2 = qx * qx + qz * qz;
+    if (d2 < best) { best = d2; bs = g.sa + (g.sb - g.sa) * u; }
+  }
+  _rqD = Math.sqrt(best); _rqS = bs;
+}
+function riverAdjust(h, x, z) {
+  for (const rv of RIVERS) {
+    if (x < rv.x0 || x > rv.x1 || z < rv.z0 || z > rv.z1) continue;
+    if (insideLake(x, z, 1)) continue;
+    riverQuery(rv, x, z);
+    const d = _rqD;
+    if (d > 70) continue;
+    const S = _rqS;
+    let hn;
+    if (d <= RIVER_HALF) { const u = d / RIVER_HALF; hn = S + 0.2 * u * u * u * u - RIVER_DEPTH * (1 - u * u); }
+    else { const k = d - RIVER_HALF; hn = clamp(h, S + 0.2 + k * 0.09, S + 0.6 + k * 0.45); }
+    h = mix(h, hn, 1 - smooth(40, 70, d));
+  }
+  return h;
+}
+function H(x, z) { return riverAdjust(lakeAdjust(baseH(x, z), x, z), x, z); }
+
+function waterLevelAt(x, z) {
+  for (const l of LAKES) if (Math.hypot(x - l.x, z - l.z) < l.r + 4) return l.level;
+  for (const rv of RIVERS) {
+    if (x < rv.x0 || x > rv.x1 || z < rv.z0 || z > rv.z1) continue;
+    riverQuery(rv, x, z);
+    if (_rqD < RIVER_HALF + 0.6) return _rqS;
+  }
+  return -Infinity;
+}
+function waterDepthAt(x, z) {
+  const lv = waterLevelAt(x, z);
+  return lv === -Infinity ? 0 : Math.max(0, lv - H(x, z));
+}
+function nearWater(x, z) {
+  for (const l of LAKES) if (Math.hypot(x - l.x, z - l.z) < l.r + 25) return true;
+  for (const rv of RIVERS) {
+    if (x < rv.x0 || x > rv.x1 || z < rv.z0 || z > rv.z1) continue;
+    riverQuery(rv, x, z);
+    if (_rqD < 16) return true;
+  }
+  return false;
+}
+function sandAt(x, z) {
+  for (const l of LAKES) {
+    if (!l.beach) continue;
+    const dd = Math.hypot(x - l.x, z - l.z);
+    if (dd >= l.r && dd < l.r + 60 && H(x, z) - l.level < 3.2) return true;
+  }
+  return false;
+}
+
+const SURF_ROAD = 0, SURF_GRASS = 1, SURF_SNOW = 2, SURF_WATER = 3, SURF_SAND = 4;
+function surfaceAt(x, z) {
+  if (Math.abs(x) <= CITY_HALF + 1 && Math.abs(z) <= CITY_HALF + 1) {
+    for (const p of ROAD_LINES) if (Math.abs(x - p) < 6.5 || Math.abs(z - p) < 6.5) return SURF_ROAD;
+    return SURF_GRASS;
+  }
+  if (z < -175) { const s = -z - 180; if (Math.abs(x - pathX(s)) < 5.5) return SURF_ROAD; }
+  if (waterDepthAt(x, z) > 0.15) return SURF_WATER;
+  if (sandAt(x, z)) return SURF_SAND;
+  return snowMask(x, z, H(x, z)) > 0.5 ? SURF_SNOW : SURF_GRASS;
+}
+
+// ================================================================ текстури
+const facadeTex = canvasTex(128, (g) => {
+  g.fillStyle = '#f4f1ea'; g.fillRect(0, 0, 128, 128);
+  for (let i = 0; i < 700; i++) { g.fillStyle = `rgba(0,0,0,${Math.random() * 0.05})`; g.fillRect(Math.random() * 128, Math.random() * 128, 2, 2); }
+  g.fillStyle = '#d9d5cc'; g.fillRect(24, 20, 80, 84);
+  const gr = g.createLinearGradient(0, 24, 0, 100);
+  gr.addColorStop(0, '#6f93a6'); gr.addColorStop(1, '#1d2f3a');
+  g.fillStyle = gr; g.fillRect(28, 24, 72, 76);
+  g.fillStyle = '#b8b4aa'; g.fillRect(62, 24, 4, 76); g.fillRect(28, 58, 72, 3);
+  g.fillStyle = '#bdb8ad'; g.fillRect(20, 104, 88, 6);
+});
+const asphaltTex = canvasTex(256, (g, s) => {
+  g.fillStyle = '#3b4146'; g.fillRect(0, 0, s, s);
+  for (let i = 0; i < 5000; i++) {
+    const v = 40 + Math.random() * 50;
+    g.fillStyle = `rgba(${v},${v},${v + 4},${0.25 + Math.random() * 0.4})`;
+    g.fillRect(Math.random() * s, Math.random() * s, 1 + Math.random() * 2, 1 + Math.random() * 2);
+  }
+});
+const groundTex = canvasTex(256, (g, s) => {
+  g.fillStyle = '#d0d0d0'; g.fillRect(0, 0, s, s);
+  for (let i = 0; i < 6000; i++) {
+    const v = 150 + Math.random() * 105;
+    g.fillStyle = `rgba(${v},${v},${v},${0.15 + Math.random() * 0.35})`;
+    g.fillRect(Math.random() * s, Math.random() * s, 2 + Math.random() * 3, 2 + Math.random() * 3);
+  }
+});
+
+// ================================================================ місто
+const buildingBoxes = [];
+const wallMats = new Map();
+const roofMat = mat(0x5d5a55, 0.9);
+function wallMat(color) {
+  if (!wallMats.has(color)) wallMats.set(color, new THREE.MeshStandardMaterial({ map: facadeTex, color, roughness: 0.85 }));
+  return wallMats.get(color);
+}
+
+function makeCity() {
+  const roadMat = new THREE.MeshStandardMaterial({ map: asphaltTex, roughness: 0.92 });
+  const sidewalkMat = mat(0x9a9b96, 0.95);
+
+  for (const p of ROAD_LINES) {
+    const gh = new THREE.BoxGeometry(CITY_HALF * 2, .08, 13); scaleUV(gh, 60, 2);
+    const horizontal = new THREE.Mesh(gh, roadMat);
+    horizontal.position.set(0, -.035, p); horizontal.receiveShadow = true; scene.add(horizontal);
+    const gv = new THREE.BoxGeometry(13, .08, CITY_HALF * 2); scaleUV(gv, 2, 60);
+    const vertical = new THREE.Mesh(gv, roadMat);
+    vertical.position.set(p, -.03, 0); vertical.receiveShadow = true; scene.add(vertical);
+    for (const off of [-8.2, 8.2]) {
+      const a = new THREE.Mesh(new THREE.BoxGeometry(CITY_HALF * 2, .22, 2.2), sidewalkMat);
+      a.position.set(0, .02, p + off); a.receiveShadow = true; scene.add(a);
+      const b = new THREE.Mesh(new THREE.BoxGeometry(2.2, .22, CITY_HALF * 2), sidewalkMat);
+      b.position.set(p + off, .02, 0); b.receiveShadow = true; scene.add(b);
+    }
+  }
+
+  // розмітка (instanced)
+  const dashes = [];
+  for (const p of ROAD_LINES) for (let i = -170; i <= 170; i += 12) {
+    if (ROAD_LINES.some(q => Math.abs(i - q) < 9)) continue;
+    dashes.push([i, p - 0.4, 0]); dashes.push([p - 0.4, i, 1]);
+  }
+  const dashMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(4, .035, .16), whiteMat, dashes.length);
+  const m4 = new THREE.Matrix4(), q4 = new THREE.Quaternion(), p4 = new V3(), s4 = new V3(1, 1, 1);
+  dashes.forEach(([x, z, rot], i) => {
+    q4.setFromAxisAngle(Y_AXIS, rot ? Math.PI / 2 : 0);
+    dashMesh.setMatrixAt(i, m4.compose(p4.set(x, .025, z), q4, s4));
+  });
+  dashMesh.frustumCulled = false; scene.add(dashMesh);
+
+  // будинки з текстурою фасаду; центральний квартал — парк
+  const palette = [0xe0cdb0, 0xc5d0d3, 0xe6dcc8, 0xa8bcc0, 0xd8c3b4, 0xc9c8b8];
+  for (let gx = -2; gx <= 2; gx++) for (let gz = -2; gz <= 2; gz++) {
+    const cx = gx * 60, cz = gz * 60;
+    if (Math.abs(cx) < 20 && Math.abs(cz) < 20) continue;
+    for (let j = 0; j < 3; j++) {
+      const x = cx + (j - 1) * 14, z = cz + (j % 2 ? 10 : -10);
+      const h = 12 + ((Math.abs(gx * 7 + gz * 11 + j * 5) % 5) * 5);
+      const W = 10, D = 13;
+      const geo = new THREE.BoxGeometry(W, h, D);
+      const uv = geo.attributes.uv;
+      const rep = [[D, h], [D, h], [1, 1], [1, 1], [W, h], [W, h]];   // px nx py ny pz nz
+      for (let f = 0; f < 6; f++) {
+        const su = f < 2 || f > 3 ? Math.max(1, Math.round(rep[f][0] / 3.3)) : 1;
+        const sv = f < 2 || f > 3 ? Math.max(1, Math.round(rep[f][1] / 3.2)) : 1;
+        for (let k = 0; k < 4; k++) { const i = f * 4 + k; uv.setXY(i, uv.getX(i) * su, uv.getY(i) * sv); }
+      }
+      const wm = wallMat(palette[(Math.abs(gx + gz + j)) % palette.length]);
+      const mesh = new THREE.Mesh(geo, [wm, wm, roofMat, roofMat, wm, wm]);
+      mesh.position.set(x, h / 2, z); mesh.castShadow = true; mesh.receiveShadow = true;
+      scene.add(mesh);
+      box(scene, W + .6, .5, D + .6, roofMat, x, h + .25, z);
+      buildingBoxes.push({ x, y: h / 2, z, hx: 5, hy: h / 2, hz: 6.5 });
+    }
+  }
+
+  // дерева вздовж тротуарів (instanced)
+  const spots = [];
+  for (const p of ROAD_LINES) for (const off of [-10, 10]) {
+    for (let i = -165; i <= 165; i += 18) {
+      if (ROAD_LINES.some(q => Math.abs(i - q) < 11)) continue;
+      spots.push([i, p + off]); spots.push([p + off, i]);
+    }
+  }
+  const trunks = new THREE.InstancedMesh(new THREE.CylinderGeometry(.22, .3, 2.2, 7), mat(0x59402b), spots.length);
+  const crowns = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1.5, 1), new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 }), spots.length);
+  const rnd = mulberry(7), col = new THREE.Color();
+  spots.forEach(([x, z], i) => {
+    const sc = 0.85 + rnd() * 0.5;
+    trunks.setMatrixAt(i, m4.compose(p4.set(x, 1.1, z), q4.identity(), s4.set(1, 1, 1)));
+    crowns.setMatrixAt(i, m4.compose(p4.set(x, 3.2 + sc * 0.3, z), q4.identity(), s4.set(sc, sc * 1.1, sc)));
+    crowns.setColorAt(i, col.setHSL(0.3 + rnd() * 0.06, 0.4, 0.2 + rnd() * 0.08));
+  });
+  for (const m of [trunks, crowns]) { m.castShadow = true; m.frustumCulled = false; scene.add(m); }
+}
+
+// ================================================================ рельєф, гірська дорога, ліс
+function buildTerrain() {
+  const SIZE = WOR
