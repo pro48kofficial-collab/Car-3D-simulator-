@@ -462,4 +462,381 @@ function makeCity() {
 
 // ================================================================ рельєф, гірська дорога, ліс
 function buildTerrain() {
-  const SIZE = WOR
+  const SIZE = WORLD_HALF * 2, SEG = 360;
+  const geo = new THREE.PlaneGeometry(SIZE, SIZE, SEG, SEG);
+  geo.rotateX(-Math.PI / 2);
+  const pos = geo.attributes.position;
+  for (let i = 0; i < pos.count; i++) pos.setY(i, H(pos.getX(i), pos.getZ(i)) - 0.13);
+  geo.computeVertexNormals();
+  scaleUV(geo, SIZE / 9, SIZE / 9);
+
+  const nor = geo.attributes.normal;
+  const colors = new Float32Array(pos.count * 3);
+  const cGrass = new THREE.Color(0x54733f), cMeadow = new THREE.Color(0x73a04a), cForest = new THREE.Color(0x3b5636);
+  const cRock = new THREE.Color(0x7c776e), cSnow = new THREE.Color(0xf3f7fb), cDirt = new THREE.Color(0x6c5b44);
+  const cSand = new THREE.Color(0xe0cf9f), cGravel = new THREE.Color(0x8b857a), cBed = new THREE.Color(0x3d5b57);
+  const c = new THREE.Color();
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), z = pos.getZ(i), h = pos.getY(i) + 0.13;
+    const slope = 1 - nor.getY(i);
+    c.copy(cGrass);
+    c.lerp(cForest, smooth(3, 35, h) * 0.8);
+    c.lerp(cRock, smooth(0.16, 0.34, slope));
+    c.lerp(cRock, smooth(45, 70, h) * 0.6);
+    let sn = snowMask(x, z, h) * (1 - smooth(0.4, 0.6, slope) * 0.7);
+    c.lerp(cSnow, sn);
+    let mm = 0;
+    for (const m of MEADOWS) mm = Math.max(mm, 1 - smooth(m.r, m.r + 14, Math.hypot(x - m.x, z - m.z)));
+    c.lerp(cMeadow, mm * 0.85 * (1 - sn));
+    if (z < -175) { const lat = Math.abs(x - pathX(-z - 180)); c.lerp(cDirt, (1 - smooth(6, 12, lat)) * 0.9); }
+    for (const l of LAKES) {
+      const dd = Math.hypot(x - l.x, z - l.z);
+      if (dd > l.r + 62) continue;
+      const rel = h - l.level;
+      const base = l.beach ? cSand : cGravel;
+      const sandW = (1 - smooth(l.r + 6, l.r + (l.beach ? 60 : 24), dd)) * (1 - smooth(1.8, l.beach ? 3.6 : 2.4, rel));
+      c.lerp(base, sandW * (l.beach ? 1 : 0.7));
+      if (rel < 0.4) { c.copy(base).lerp(cBed, smooth(0, 4, -rel)); if (rel > 0) c.multiplyScalar(0.8); }
+    }
+    for (const rv of RIVERS) {
+      if (x < rv.x0 || x > rv.x1 || z < rv.z0 || z > rv.z1 || insideLake(x, z, 2)) continue;
+      riverQuery(rv, x, z);
+      if (_rqD < 9) { c.lerp(cGravel, 1 - smooth(4, 9, _rqD)); if (_rqD < RIVER_HALF) c.lerp(cBed, (1 - smooth(2, RIVER_HALF, _rqD)) * 0.7); }
+    }
+    c.multiplyScalar(0.88 + vnoise(x / 6, z / 6) * 0.24);
+    colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  const terrain = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ vertexColors: true, map: groundTex, roughness: 1 }));
+  terrain.receiveShadow = true; terrain.frustumCulled = false;
+  scene.add(terrain);
+
+  // асфальтова стрічка гірської дороги з розміткою
+  const pts = [];
+  for (let s = -8; s <= 520; s += 2) {
+    const x = pathX(s), z = -180 - s;
+    const dxds = s > 0 ? (28 / 70) * Math.cos(s / 70) : 0;
+    const len = Math.hypot(1, dxds);
+    pts.push({ x, z, px: 1 / len, pz: dxds / len, y: (s > 0 ? H(x, z) : 0) + 0.04, s });
+  }
+  const verts = [], uvs = [], idx = [], dverts = [], didx = [];
+  pts.forEach((p, i) => {
+    verts.push(p.x - p.px * 5.5, p.y, p.z - p.pz * 5.5, p.x + p.px * 5.5, p.y, p.z + p.pz * 5.5);
+    uvs.push(0, p.s / 8, 1, p.s / 8);
+    if (i < pts.length - 1) { const a = i * 2; idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
+  });
+  const road = new THREE.BufferGeometry();
+  road.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+  road.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  road.setIndex(idx); road.computeVertexNormals();
+  const roadMesh = new THREE.Mesh(road, new THREE.MeshStandardMaterial({ map: asphaltTex, roughness: 0.92, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
+  roadMesh.receiveShadow = true; roadMesh.frustumCulled = false; scene.add(roadMesh);
+  let vi = 0;
+  for (let i = 0; i < pts.length - 1; i++) {
+    if (Math.floor(pts[i].s / 4) % 2 !== 0) continue;
+    const a = pts[i], b = pts[i + 1], w = 0.14;
+    dverts.push(a.x - a.px * w, a.y + .02, a.z - a.pz * w, a.x + a.px * w, a.y + .02, a.z + a.pz * w,
+                b.x - b.px * w, b.y + .02, b.z - b.pz * w, b.x + b.px * w, b.y + .02, b.z + b.pz * w);
+    didx.push(vi, vi + 1, vi + 2, vi + 1, vi + 3, vi + 2); vi += 4;
+  }
+  const dg = new THREE.BufferGeometry();
+  dg.setAttribute('position', new THREE.Float32BufferAttribute(dverts, 3));
+  dg.setIndex(didx); dg.computeVertexNormals();
+  const dm = new THREE.Mesh(dg, new THREE.MeshStandardMaterial({ color: 0xe8c547, roughness: 0.7, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 }));
+  dm.frustumCulled = false; scene.add(dm);
+}
+
+const pines = {};
+function makePines() {
+  const TOTAL = 1600, rnd = mulberry(99);
+  const list = [];
+  for (let tries = 0; tries < 20000 && list.length < TOTAL; tries++) {
+    const x = (rnd() * 2 - 1) * (WORLD_HALF - 20), z = (rnd() * 2 - 1) * (WORLD_HALF - 20);
+    if (Math.abs(x) < 195 && Math.abs(z) < 195) continue;
+    if (MEADOWS.some(m => Math.hypot(x - m.x, z - m.z) < m.r + 8)) continue;
+    if (nearWater(x, z)) continue;
+    if (z < -170 && Math.abs(x - pathX(-z - 180)) < 14) continue;
+    const h = H(x, z);
+    if (h < 1 || h > 64) continue;
+    const gx = Math.abs(H(x + 2, z) - H(x - 2, z)) / 4, gz = Math.abs(H(x, z + 2) - H(x, z - 2)) / 4;
+    if (Math.hypot(gx, gz) > 0.9) continue;
+    if (fbm(x / 90 + 40, z / 90 + 12, 3) < 0.46) continue;
+    if (h > 45 && rnd() < (h - 45) / 25) continue;
+    list.push({ x, z, h, s: 0.8 + rnd() * 0.9 });
+  }
+  const n = list.length;
+  const mk = (geo, color) => { const m = new THREE.InstancedMesh(geo, new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 }), n); m.frustumCulled = false; scene.add(m); return m; };
+  pines.trunk = mk(new THREE.CylinderGeometry(.22, .34, 2.4, 6));
+  pines.c1 = mk(new THREE.ConeGeometry(2.4, 5.2, 8));
+  pines.c2 = mk(new THREE.ConeGeometry(1.7, 4.2, 8));
+  const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), p = new V3(), sc = new V3(), col = new THREE.Color();
+  list.forEach((t, i) => {
+    q.setFromAxisAngle(Y_AXIS, rnd() * 6.28);
+    pines.trunk.setMatrixAt(i, m4.compose(p.set(t.x, t.h + 1.1 * t.s, t.z), q, sc.set(t.s, t.s, t.s)));
+    pines.c1.setMatrixAt(i, m4.compose(p.set(t.x, t.h + 4.2 * t.s, t.z), q, sc.set(t.s, t.s, t.s)));
+    pines.c2.setMatrixAt(i, m4.compose(p.set(t.x, t.h + 7.0 * t.s, t.z), q, sc.set(t.s, t.s, t.s)));
+    const snowy = smooth(38, 62, t.h);
+    col.setHSL(0.36 + rnd() * 0.04, 0.45, 0.14 + rnd() * 0.06).lerp(new THREE.Color(0xdfe8ee), snowy * 0.75);
+    pines.c1.setColorAt(i, col); pines.c2.setColorAt(i, col);
+    pines.trunk.setColorAt(i, col.setHex(0x4d3a28));
+  });
+  pines.total = n;
+}
+
+// ================================================================ сніг
+let snowPoints;
+const snowUniforms = {
+  uTime: { value: 0 }, uCam: { value: new V3() }, uBox: { value: new V3(60, 35, 60) },
+  uOpacity: { value: 0 }, uSize: { value: 1.4 }, uPR: { value: 1 }
+};
+function makeSnow() {
+  const N = 9000, rnd = mulberry(5);
+  const p = new Float32Array(N * 3), sp = new Float32Array(N);
+  for (let i = 0; i < N; i++) { p[i * 3] = rnd(); p[i * 3 + 1] = rnd(); p[i * 3 + 2] = rnd(); sp[i] = 0.7 + rnd() * 0.6; }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(p, 3));
+  g.setAttribute('aSpeed', new THREE.BufferAttribute(sp, 1));
+  const m = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, uniforms: snowUniforms,
+    vertexShader: `
+      uniform float uTime; uniform vec3 uCam; uniform vec3 uBox; uniform float uSize; uniform float uPR;
+      attribute float aSpeed;
+      void main(){
+        vec3 p = position * uBox;
+        p.y -= uTime * (2.0 + aSpeed * 2.5);
+        p.x += uTime * 1.2 * aSpeed + sin(uTime * 0.8 + position.z * 20.0) * 0.6;
+        p.z += uTime * 0.5 * aSpeed + cos(uTime * 0.7 + position.x * 20.0) * 0.6;
+        vec3 rel = mod(p - uCam + uBox * 0.5, uBox);
+        vec3 world = uCam - uBox * 0.5 + rel;
+        vec4 mv = viewMatrix * vec4(world, 1.0);
+        gl_Position = projectionMatrix * mv;
+        gl_PointSize = clamp(uSize * uPR * (30.0 / max(-mv.z, 0.1)), 1.0, 14.0);
+      }`,
+    fragmentShader: `
+      uniform float uOpacity;
+      void main(){
+        float d = length(gl_PointCoord - 0.5);
+        float a = (1.0 - smoothstep(0.15, 0.5, d)) * uOpacity;
+        if (a < 0.01) discard;
+        gl_FragColor = vec4(1.0, 1.0, 1.05, a);
+      }`
+  });
+  snowPoints = new THREE.Points(g, m);
+  snowPoints.frustumCulled = false; snowPoints.visible = false;
+  scene.add(snowPoints);
+}
+
+// ================================================================ джип (як у v0.2)
+const DRIVER_X = -0.45;
+const CABIN_EYE = new V3(DRIVER_X, 1.4, 0.22);
+const WHEEL_R = 0.46;
+const spinners = [], frontPivots = [], hands = [], driverBits = [];
+let steerPivot, steerWheel, carMesh;
+
+function makeWheel(parent, side, x, z, steerable) {
+  const pivot = new THREE.Group();
+  pivot.position.set(x, WHEEL_R, z);
+  const spin = new THREE.Group();
+  pivot.add(spin);
+  const tireMat = mat(0x141517, 0.9, 0.05), rimMat = mat(0xb4babd, 0.35, 0.85), nutMat = mat(0x303438, 0.5, 0.8);
+  const tire = new THREE.Mesh(new THREE.CylinderGeometry(WHEEL_R, WHEEL_R, 0.32, 28), tireMat);
+  tire.rotation.z = Math.PI / 2; tire.castShadow = true; spin.add(tire);
+  for (let i = 0; i < 18; i++) {
+    const a = i / 18 * Math.PI * 2;
+    const lug = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.07, 0.11), tireMat);
+    lug.position.set(0, Math.cos(a) * (WHEEL_R + 0.015), Math.sin(a) * (WHEEL_R + 0.015));
+    lug.rotation.x = a; spin.add(lug);
+  }
+  const rim = new THREE.Mesh(new THREE.CylinderGeometry(0.27, 0.27, 0.34, 14), rimMat);
+  rim.rotation.z = Math.PI / 2; spin.add(rim);
+  const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.36, 10), nutMat);
+  cap.rotation.z = Math.PI / 2; spin.add(cap);
+  for (let i = 0; i < 5; i++) {
+    const a = i / 5 * Math.PI * 2;
+    const nut = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.04, 6), nutMat);
+    nut.rotation.z = Math.PI / 2;
+    nut.position.set(side * 0.175, Math.cos(a) * 0.15, Math.sin(a) * 0.15);
+    spin.add(nut);
+  }
+  parent.add(pivot);
+  spinners.push(spin);
+  if (steerable) frontPivots.push(pivot);
+}
+
+function makeHand(side) {
+  const skin = mat(0xe0ac86, 0.65);
+  const g = new THREE.Group();
+  const palm = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.09, 0.05), skin); palm.position.z = 0.03; g.add(palm);
+  const fingers = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.085, 0.022), skin); fingers.position.z = -0.03; g.add(fingers);
+  const thumb = new THREE.Mesh(new THREE.BoxGeometry(0.026, 0.06, 0.03), skin);
+  thumb.position.set(-side * 0.03, 0.045, 0.012); thumb.rotation.z = side * 0.4; g.add(thumb);
+  return g;
+}
+
+function makeCar() {
+  carMesh = new THREE.Group();
+  const bodyMat = new THREE.MeshPhysicalMaterial({ color: 0x4b6b2e, metalness: 0.3, roughness: 0.4, clearcoat: 1, clearcoatRoughness: 0.15 });
+  const darkMat = mat(0x15181b, 0.6, 0.3);
+  const steelMat = mat(0x2a2e32, 0.4, 0.7);
+  const floorMat = mat(0x23272a, 0.9);
+  const seatMat = mat(0x262a2e, 0.85);
+  const dashMat = mat(0x1b1f23, 0.75);
+  const cageMat = mat(0x14171a, 0.5, 0.5);
+  const headMat = new THREE.MeshStandardMaterial({ color: 0xf5f2d7, emissive: 0x77704b });
+  const lampRim = mat(0x0d0f11, 0.4, 0.8);
+  const amberMat = new THREE.MeshStandardMaterial({ color: 0xffa52a, emissive: 0x6b3d00 });
+  const tailMat = new THREE.MeshStandardMaterial({ color: 0xb01a1a, emissive: 0x500808 });
+  const jeepGlass = new THREE.MeshStandardMaterial({ color: 0x9fc4d4, roughness: 0.1, metalness: 0.2, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false });
+
+  box(carMesh, 1.8, .1, 3.9, floorMat, 0, .5, .08);
+  box(carMesh, 1.5, .5, 1.4, bodyMat, 0, .8, -1.35);
+  box(carMesh, 1.52, .1, 1.35, bodyMat, 0, 1.1, -1.38);
+  box(carMesh, .5, .05, .5, bodyMat, 0, 1.16, -1.4);
+  for (const s of [-1, 1]) {
+    box(carMesh, .33, .1, 1.15, bodyMat, s * 1.0, 1.06, -1.4);
+    box(carMesh, .33, .1, 1.05, bodyMat, s * 1.0, 1.06, 1.35);
+    box(carMesh, .1, .5, 2.6, bodyMat, s * .9, .78, .65);
+    box(carMesh, .14, .4, .1, bodyMat, s * .9, .76, -.68);
+  }
+  box(carMesh, 1.8, .5, .1, bodyMat, 0, .78, 1.95);
+  box(carMesh, 1.3, .5, .1, bodyMat, 0, .92, -2.06);
+  for (let i = 0; i < 7; i++) box(carMesh, .09, .32, .04, darkMat, -.6 + i * .2, .92, -2.12, false);
+  for (const s of [-1, 1]) {
+    const ring = new THREE.Mesh(new THREE.CylinderGeometry(.18, .18, .08, 20), lampRim);
+    ring.rotation.x = Math.PI / 2; ring.position.set(s * .63, 1.0, -2.08); carMesh.add(ring);
+    const lamp = new THREE.Mesh(new THREE.CylinderGeometry(.145, .145, .1, 20), headMat);
+    lamp.rotation.x = Math.PI / 2; lamp.position.set(s * .63, 1.0, -2.12); carMesh.add(lamp);
+    box(carMesh, .14, .1, .05, amberMat, s * .9, .8, -2.1, false);
+    box(carMesh, .12, .22, .05, tailMat, s * .8, .85, 2.02, false);
+    box(carMesh, .05, .16, .1, darkMat, s * 1.0, 1.45, -.62, false);
+    bar(carMesh, new V3(s * .9, 1.12, -.6), new V3(s * 1.0, 1.42, -.62), .015, darkMat, 6);
+  }
+  box(carMesh, 1.95, .18, .22, steelMat, 0, .5, -2.15);
+  box(carMesh, 1.95, .16, .2, steelMat, 0, .5, 2.1);
+  const spare = new THREE.Mesh(new THREE.CylinderGeometry(.4, .4, .28, 22), mat(0x141517, 0.9));
+  spare.rotation.x = Math.PI / 2; spare.position.set(0, .98, 2.2); spare.castShadow = true; carMesh.add(spare);
+  const spareHub = new THREE.Mesh(new THREE.CylinderGeometry(.2, .2, .3, 12), mat(0xb4babd, .35, .85));
+  spareHub.rotation.x = Math.PI / 2; spareHub.position.set(0, .98, 2.2); carMesh.add(spareHub);
+
+  for (const s of [-1, 1]) {
+    makeWheel(carMesh, s, s * 1.02, -1.4, true);
+    makeWheel(carMesh, s, s * 1.02, 1.35, false);
+  }
+
+  const glass = new THREE.Mesh(new THREE.BoxGeometry(1.6, .78, .02), jeepGlass);
+  glass.position.set(0, 1.43, -.55); glass.rotation.x = .27; carMesh.add(glass);
+  for (const s of [-1, 1]) {
+    bar(carMesh, new V3(s * .8, 1.05, -.65), new V3(s * .8, 1.8, -.45), .028, cageMat);
+    bar(carMesh, new V3(s * .82, 1.8, -.45), new V3(s * .82, 1.95, 1.45), .025, cageMat);
+    bar(carMesh, new V3(s * .82, 1.03, .6), new V3(s * .82, 1.87, .6), .025, cageMat);
+    bar(carMesh, new V3(s * .82, 1.03, 1.45), new V3(s * .82, 1.95, 1.45), .025, cageMat);
+  }
+  bar(carMesh, new V3(-.82, 1.8, -.45), new V3(.82, 1.8, -.45), .028, cageMat);
+  bar(carMesh, new V3(-.82, 1.87, .6), new V3(.82, 1.87, .6), .022, cageMat);
+  bar(carMesh, new V3(-.82, 1.95, 1.45), new V3(.82, 1.95, 1.45), .022, cageMat);
+
+  for (const x of [-.45, .45]) {
+    box(carMesh, .5, .12, .5, seatMat, x, .68, .6);
+    const back = box(carMesh, .5, .6, .1, seatMat, x, 1.0, .86); back.rotation.x = .15;
+    box(carMesh, .3, .16, .08, seatMat, x, 1.38, .93);
+  }
+  box(carMesh, 1.6, .12, .5, seatMat, 0, .68, 1.5);
+  box(carMesh, 1.6, .5, .1, seatMat, 0, .98, 1.78);
+  box(carMesh, 1.76, .26, .34, dashMat, 0, .98, -.55);
+  box(carMesh, .56, .16, .22, dashMat, DRIVER_X, 1.27, -.56);
+  const gaugeMat = new THREE.MeshStandardMaterial({ color: 0x0c1a20, emissive: 0x1b6f66, emissiveIntensity: 0.8 });
+  for (const dx of [-.13, .13]) {
+    const gauge = new THREE.Mesh(new THREE.CylinderGeometry(.06, .06, .012, 20), gaugeMat);
+    gauge.rotation.x = Math.PI / 2; gauge.position.set(DRIVER_X + dx, 1.27, -.445); carMesh.add(gauge);
+  }
+  box(carMesh, .55, .12, .02, mat(0x0d1114, .3), .45, 1.0, -.375, false);
+  box(carMesh, .22, .25, .75, dashMat, 0, .72, .1);
+  bar(carMesh, new V3(0, .84, .0), new V3(0, 1.02, -.04), .014, steelMat, 6);
+  const knob = new THREE.Mesh(new THREE.SphereGeometry(.035, 10, 8), darkMat); knob.position.set(0, 1.04, -.04); carMesh.add(knob);
+
+  steerPivot = new THREE.Group();
+  steerPivot.position.set(DRIVER_X, 1.1, -.3);
+  steerPivot.rotation.x = -.55;
+  carMesh.add(steerPivot);
+  bar(carMesh, new V3(DRIVER_X, 1.1, -.3), new V3(DRIVER_X, .92, -.55), .025, darkMat, 8);
+  steerWheel = new THREE.Group();
+  steerPivot.add(steerWheel);
+  const rimMat = mat(0x111315, 0.55, 0.1);
+  const rim = new THREE.Mesh(new THREE.TorusGeometry(.2, .022, 10, 32), rimMat); rim.castShadow = true; steerWheel.add(rim);
+  box(steerWheel, .4, .025, .03, rimMat, 0, 0, 0, false);
+  box(steerWheel, .03, .2, .03, rimMat, 0, -.1, 0, false);
+  const hub = new THREE.Mesh(new THREE.CylinderGeometry(.045, .05, .05, 14), rimMat);
+  hub.rotation.x = Math.PI / 2; steerWheel.add(hub);
+  box(steerWheel, .02, .04, .028, mat(0xb8ff3d, .4), 0, .2, 0, false);
+
+  const sleeveMat = mat(0x39424a, 0.85);
+  for (const s of [-1, 1]) {
+    const hand = makeHand(s);
+    hand.position.set(s * .2, .0, .0);
+    steerWheel.add(hand);
+    const upper = new THREE.Mesh(new THREE.CylinderGeometry(.042, .04, 1, 8), sleeveMat);
+    const fore = new THREE.Mesh(new THREE.CylinderGeometry(.036, .04, 1, 8), sleeveMat);
+    upper.castShadow = fore.castShadow = true;
+    carMesh.add(upper, fore);
+    hands.push({ node: hand, side: s, upper, fore, shoulder: new V3(DRIVER_X + s * .23, 1.2, .66) });
+  }
+  const torso = box(carMesh, .5, .58, .24, mat(0x39424a, .85), DRIVER_X, 1.07, .68);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(.12, 14, 12), mat(0xe0ac86, .65));
+  head.position.set(DRIVER_X, 1.5, .7); head.castShadow = true; carMesh.add(head);
+  const hair = new THREE.Mesh(new THREE.SphereGeometry(.125, 14, 12, 0, Math.PI * 2, 0, Math.PI / 2), mat(0x2a1d14, .9));
+  hair.position.set(DRIVER_X, 1.51, .7); hair.rotation.x = .25; carMesh.add(hair);
+  driverBits.push(torso, head, hair);
+
+  scene.add(carMesh);
+}
+
+// ================================================================ трафік (у місті)
+const traffic = [];
+function addTraffic() {
+  const colors = [0x355b78, 0xd2d0c7, 0x202326, 0x7a8d6b, 0xb3a18a];
+  for (let i = 0; i < 9; i++) {
+    const g = new THREE.Group();
+    const c = mat(colors[i % colors.length], .35, .25);
+    box(g, 1.8, .55, 3.7, c, 0, .65, 0);
+    box(g, 1.45, .55, 1.7, glassMat, 0, 1.16, -.15);
+    const t = new THREE.Mesh(new THREE.BoxGeometry(.34, .12, .05), mat(0xffe8ad));
+    t.position.set(-.52, .78, -1.88); g.add(t);
+    const t2 = t.clone(); t2.position.x = .52; g.add(t2);
+    scene.add(g);
+    traffic.push({ mesh: g, lane: i % 2 === 0 ? -30 : 30, z: -145 + i * 34, speed: 7 + (i % 4) * 2, direction: i % 2 === 0 ? 1 : -1 });
+  }
+}
+
+// ================================================================ тварини на галявинах
+const animals = [];
+const animalMats = {
+  deer: mat(0x8a5a33, 0.85), deerLight: mat(0xd9c7a8, 0.85), hoof: mat(0x1c1a18, 0.7), antler: mat(0xcdbd9a, 0.7),
+  wool: mat(0xf0ede6, 1.0), sheepFace: mat(0x2d2724, 0.9),
+  cowW: mat(0xf1efe9, 0.85), cowB: mat(0x1d1b1a, 0.85), pink: mat(0xd9a0a0, 0.8)
+};
+
+function makeLeg(parent, x, y, z, len, r, material, hoofMat) {
+  const pivot = new THREE.Group();
+  pivot.position.set(x, y, z);
+  const leg = new THREE.Mesh(new THREE.CylinderGeometry(r, r * 0.8, len, 6), material);
+  leg.position.y = -len / 2; leg.castShadow = true; pivot.add(leg);
+  if (hoofMat) { const hf = new THREE.Mesh(new THREE.CylinderGeometry(r * 0.85, r * 0.9, 0.06, 6), hoofMat); hf.position.y = -len + 0.03; pivot.add(hf); }
+  parent.add(pivot);
+  return pivot;
+}
+
+function makeAnimal(type) {
+  const g = new THREE.Group();
+  const legs = [];
+  const M = animalMats;
+  if (type === 'deer') {
+    const L = 0.8;
+    box(g, .42, .46, 1.1, M.deer, 0, L + .25, 0);
+    box(g, .36, .2, .8, M.deerLight, 0, L + .05, .02, false);
+    const neck = box(g, .2, .55, .22, M.deer, 0, L + .62, -.58); neck.rotation.x = -.6;
+    box(g, .2, .2, .36, M.deer, 0, L + .98, -.82);
+    box(g, .1, .1, .12, M.hoof, 0, L + .94, -1.02, false);
+    box(g, .06, .12, .04, M.deer, -.1, L + 1.12, -.72, false); box(g, .06, .12, .04, M.deer, .1, L + 1.12, -.72, false);
+    box(g, .1, .1, .06, M.deerLight, 0, L + .42, .58, false);
+    for (const s of [-1, 1]) {
+      bar(g, new V3(s * .06, L + 1
