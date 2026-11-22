@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import './style.css';
+import { buildRoadMeshes, buildCity2, buildFarm } from './world2.js';
 
 const game = document.querySelector('#game');
 const loading = document.querySelector('#loading');
@@ -9,7 +10,10 @@ const speedEl = document.querySelector('#speed');
 const gearEl = document.querySelector('#gear');
 const wheelEl = document.querySelector('#wheel');
 const cameraBtn = document.querySelector('#cameraBtn');
-const qualityBtn = document.querySelector('#qualityBtn');
+const menuBtn = document.querySelector('#menuBtn');
+const menuEl = document.querySelector('#menu');
+const settingsEl = document.querySelector('#settings');
+let inMenu = true, menuT = 0;
 const statusEl = document.querySelector('.status');
 
 const V3 = THREE.Vector3;
@@ -147,14 +151,20 @@ function mulberry(seed) {
 const WORLD_HALF = 700;
 const ROAD_LINES = [-90, -30, 30, 90];
 const CITY_HALF = 180;
+const FARM = { x: 380, z: 10 };
+const CITY2 = { x: 150, z: 440, half: 105 };
+const SITES = [{ x: FARM.x, z: FARM.z, r: 150 }, { x: CITY2.x, z: CITY2.z, r: 165 }];
+const LOWLAND = { x: 290, z: 240, r: 300 };      // рівнина на південному сході: ферма, нове місто, дороги між ними
 const MEADOWS = [
   { x: 0, z: 0, r: 18, flat: true },
   { x: -235, z: 70, r: 50 },
   { x: 240, z: -80, r: 50 },
   { x: 175, z: -310, r: 55 },
   { x: -120, z: -330, r: 55 },
-  { x: 50, z: 260, r: 50 },
-  { x: -250, z: -130, r: 50 }
+  { x: -60, z: 330, r: 50 },
+  { x: -250, z: -130, r: 50 },
+  { x: FARM.x + 80, z: FARM.z + 20, r: 19, flat: true, animals: ['cow', 'cow', 'cow', 'cow'] },     // вигони ферми
+  { x: FARM.x + 80, z: FARM.z + 62, r: 15, flat: true, animals: ['sheep', 'sheep', 'sheep', 'sheep', 'sheep'] }
 ];
 // гірська дорога на північ від міста: x = 30 + 28·sin(s/70), де s = -z - 180
 const pathX = s => 30 + 28 * Math.sin(Math.max(s, 0) / 70);
@@ -174,6 +184,14 @@ function baseH(x, z) {
     if (m.flat) continue;
     const dm = Math.hypot(x - m.x, z - m.z);
     if (dm < m.r + 90) h *= smooth(m.r, m.r + 90, dm);
+  }
+  for (const m of SITES) {
+    const dm = Math.hypot(x - m.x, z - m.z);
+    if (dm < m.r + 100) h *= smooth(m.r, m.r + 100, dm);
+  }
+  {
+    const dl = Math.hypot(x - LOWLAND.x, z - LOWLAND.z);
+    if (dl < LOWLAND.r + 150) h *= mix(0.1, 1, smooth(LOWLAND.r, LOWLAND.r + 150, dl));
   }
   const s = -z - 180;
   if (s > 0 && s < 540) {
@@ -299,7 +317,7 @@ function riverAdjust(h, x, z) {
   }
   return h;
 }
-function H(x, z) { return riverAdjust(lakeAdjust(baseH(x, z), x, z), x, z); }
+function H(x, z) { return roadAdjust(riverAdjust(lakeAdjust(baseH(x, z), x, z), x, z), x, z); }
 
 function waterLevelAt(x, z) {
   for (const l of LAKES) if (Math.hypot(x - l.x, z - l.z) < l.r + 4) return l.level;
@@ -332,12 +350,206 @@ function sandAt(x, z) {
   return false;
 }
 
+// ================================================================ дороги (дані): кільцева, з'їзди, до ферми й нового міста
+const ROAD_HALF_W = 6;
+const ROADS = [];
+const roadGrid = new Map();
+const RCELL = 48;
+const cellKey = (x, z, c) => (Math.floor(x / c) + 512) * 1024 + (Math.floor(z / c) + 512);
+function roadInsert(seg) {
+  const x0 = Math.floor((Math.min(seg.ax, seg.bx) - 46) / RCELL), x1 = Math.floor((Math.max(seg.ax, seg.bx) + 46) / RCELL);
+  const z0 = Math.floor((Math.min(seg.az, seg.bz) - 46) / RCELL), z1 = Math.floor((Math.max(seg.az, seg.bz) + 46) / RCELL);
+  for (let ix = x0; ix <= x1; ix++) for (let iz = z0; iz <= z1; iz++) {
+    const k = (ix + 512) * 1024 + (iz + 512);
+    let l = roadGrid.get(k); if (!l) { l = []; roadGrid.set(k, l); }
+    l.push(seg);
+  }
+}
+let _rdD = Infinity, _rdR = 0;
+function roadQuery(x, z) {
+  const l = roadGrid.get(cellKey(x, z, RCELL));
+  if (!l) { _rdD = Infinity; return false; }
+  let best = Infinity, r = 0;
+  for (let i = 0; i < l.length; i++) {
+    const g = l[i];
+    const vx = g.bx - g.ax, vz = g.bz - g.az;
+    let u = ((x - g.ax) * vx + (z - g.az) * vz) / g.l2;
+    u = u < 0 ? 0 : u > 1 ? 1 : u;
+    const qx = g.ax + vx * u - x, qz = g.az + vz * u - z, d2 = qx * qx + qz * qz;
+    if (d2 < best) { best = d2; r = g.ra + (g.rb - g.ra) * u; }
+  }
+  _rdD = Math.sqrt(best); _rdR = r;
+  return true;
+}
+function roadDistAt(x, z) { return roadQuery(x, z) ? _rdD : Infinity; }
+function roadHeightAt(x, z) { return roadQuery(x, z) ? _rdR : 0; }
+function roadAdjust(h, x, z) {
+  if (!roadQuery(x, z) || _rdD > 45) return h;
+  const d = _rdD, R = _rdR, hw = ROAD_HALF_W + 1;
+  let hn;
+  if (d <= hw) hn = R;
+  else { const k = d - hw; hn = clamp(h, R - 0.2 - k * 0.6, R + 0.2 + k * 0.6); }   // виїмки й насипи ≤ 0.6
+  return mix(h, hn, 1 - smooth(25, 45, d));
+}
+
+function resampleRoad(ctrl, step) {
+  const out = [], n = ctrl.length;
+  const get = i => ctrl[Math.max(0, Math.min(n - 1, i))];
+  for (let i = 0; i < n - 1; i++) {
+    const p0 = get(i - 1), p1 = get(i), p2 = get(i + 1), p3 = get(i + 2);
+    const len = Math.hypot(p2.x - p1.x, p2.z - p1.z), k = Math.max(1, Math.round(len / step));
+    for (let j = 0; j < k; j++) {
+      const t = j / k, t2 = t * t, t3 = t2 * t;
+      out.push({
+        x: 0.5 * (2 * p1.x + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+        z: 0.5 * (2 * p1.z + (-p0.z + p2.z) * t + (2 * p0.z - 5 * p1.z + 4 * p2.z - p3.z) * t2 + (-p0.z + 3 * p1.z - 3 * p2.z + p3.z) * t3)
+      });
+    }
+  }
+  out.push({ x: ctrl[n - 1].x, z: ctrl[n - 1].z });
+  return out;
+}
+function gradeProfile(raw, spacing, pinA, pinB, g) {
+  const n = raw.length, R = raw.slice(), ramp = Math.max(2, Math.round(60 / spacing));
+  if (pinA != null) for (let i = 0; i < n; i++) { const w = Math.max(0, 1 - i / ramp); R[i] = R[i] * (1 - w) + pinA * w; }
+  if (pinB != null) for (let i = 0; i < n; i++) { const w = Math.max(0, 1 - (n - 1 - i) / ramp); R[i] = R[i] * (1 - w) + pinB * w; }
+  for (let it = 0; it < 40; it++) for (let i = 1; i < n - 1; i++) R[i] = (R[i - 1] + 2 * R[i] + R[i + 1]) / 4;
+  const lim = g * spacing;
+  for (let it = 0; it < 8; it++) {
+    for (let i = 1; i < n - 1; i++) R[i] = clamp(R[i], R[i - 1] - lim, R[i - 1] + lim);
+    for (let i = n - 2; i > 0; i--) R[i] = clamp(R[i], R[i + 1] - lim, R[i + 1] + lim);
+  }
+  if (pinA != null) R[0] = pinA;
+  if (pinB != null) R[n - 1] = pinB;
+  return R;
+}
+function addRoad(name, pts, opt = {}) {
+  const n = pts.length;
+  const raw = pts.map(p => hLake(p.x, p.z));
+  let R;
+  if (opt.closed) {
+    R = raw.map((_, i) => { let s = 0; for (let k = -5; k <= 5; k++) s += raw[(i + k + n) % n]; return clamp(s / 11, 0, 1.2); });
+  } else R = gradeProfile(raw, 6, opt.pinA, opt.pinB, opt.grade || 0.1);
+  pts.forEach((p, i) => { p.R = R[i]; });
+  const road = { name, pts, width: opt.width || 12, closed: !!opt.closed };
+  ROADS.push(road);
+  const m = opt.closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const a = pts[i], b = pts[(i + 1) % n];
+    roadInsert({ ax: a.x, az: a.z, bx: b.x, bz: b.z, ra: a.R, rb: b.R, l2: (b.x - a.x) ** 2 + (b.z - a.z) ** 2 || 1 });
+  }
+  return road;
+}
+(function buildRoadNetwork() {
+  const RING = 195, CR = 25, C = RING - CR, step = 6;
+  const ring = [];
+  const arc = (cx, cz, a0, a1) => {
+    const k = Math.max(2, Math.round(CR * Math.abs(a1 - a0) / step));
+    for (let i = 0; i < k; i++) { const a = a0 + (a1 - a0) * i / k; ring.push({ x: cx + CR * Math.cos(a), z: cz + CR * Math.sin(a) }); }
+  };
+  const side = (x0, z0, x1, z1) => {
+    const k = Math.round(Math.hypot(x1 - x0, z1 - z0) / step);
+    for (let i = 0; i < k; i++) ring.push({ x: x0 + (x1 - x0) * i / k, z: z0 + (z1 - z0) * i / k });
+  };
+  side(RING, -C, RING, C); arc(C, C, 0, Math.PI / 2);
+  side(C, RING, -C, RING); arc(-C, C, Math.PI / 2, Math.PI);
+  side(-RING, C, -RING, -C); arc(-C, -C, Math.PI, Math.PI * 1.5);
+  side(-C, -RING, C, -RING); arc(C, -C, Math.PI * 1.5, Math.PI * 2);
+  addRoad('ring', ring, { closed: true });
+
+  // з'їзди з усіх вулиць старого міста на кільце
+  for (const p of ROAD_LINES) for (const s of [-1, 1]) {
+    for (const [x0, z0, x1, z1] of [[s * 180, p, s * RING, p], [p, s * 180, p, s * RING]]) {
+      const pts = resampleRoad([{ x: x0, z: z0 }, { x: x1, z: z1 }], 5);
+      addRoad('stub', pts, { width: 12, pinA: 0, pinB: roadHeightAt(x1, z1), grade: 0.2 });
+    }
+  }
+  const spur = (name, ctrl, pinA) => {
+    const pts = resampleRoad(ctrl, 6), last = ctrl[ctrl.length - 1];
+    return addRoad(name, pts, { pinA: pinA != null ? pinA : roadHeightAt(ctrl[0].x, ctrl[0].z), pinB: 0 });
+  };
+  spur('to-city2', [{ x: 90, z: 195 }, { x: 100, z: 235 }, { x: 125, z: 275 }, { x: 148, z: 312 }, { x: 150, z: 335 }]);
+  spur('to-farm', [{ x: 195, z: 30 }, { x: 240, z: 35 }, { x: 285, z: 26 }, { x: 330, z: 12 }, { x: 352, z: 10 }]);
+  spur('farm-city2', [{ x: 352, z: 10 }, { x: 375, z: 45 }, { x: 398, z: 100 }, { x: 402, z: 170 }, { x: 382, z: 240 }, { x: 335, z: 320 }, { x: 285, z: 395 }, { x: 256, z: 440 }], 0);
+})();
+
+// ================================================================ нерівності: каміння, бордюри, борозни
+const stoneGrid = new Map(), rectGrid = new Map();
+function addBumpRect(r) {
+  for (let ix = Math.floor(r.x0 / 16); ix <= Math.floor(r.x1 / 16); ix++) for (let iz = Math.floor(r.z0 / 16); iz <= Math.floor(r.z1 / 16); iz++) {
+    const k = (ix + 512) * 1024 + (iz + 512);
+    let l = rectGrid.get(k); if (!l) { l = []; rectGrid.set(k, l); }
+    l.push(r);
+  }
+}
+function addStone(s) {
+  for (let ix = Math.floor((s.x - s.r) / 8); ix <= Math.floor((s.x + s.r) / 8); ix++) for (let iz = Math.floor((s.z - s.r) / 8); iz <= Math.floor((s.z + s.r) / 8); iz++) {
+    const k = (ix + 512) * 1024 + (iz + 512);
+    let l = stoneGrid.get(k); if (!l) { l = []; stoneGrid.set(k, l); }
+    l.push(s);
+  }
+}
+function rectBump(r, x, z) {
+  const edge = Math.min(x - r.x0, r.x1 - x, z - r.z0, r.z1 - z);
+  if (edge < 0) return 0;
+  if (r.kind === 'rows') return r.h * 0.5 * (1 + Math.sin(z * 6.2832 / r.period)) * smooth(0, 1, edge);
+  if (r.kind === 'hump') {                       // лежачий поліцейський
+    const t = r.axis === 'z' ? (z - r.z0) / (r.z1 - r.z0) : (x - r.x0) / (r.x1 - r.x0);
+    return r.h * Math.sin(Math.PI * clamp(t, 0, 1));
+  }
+  return r.h * smooth(0, 0.3, edge);             // бордюр
+}
+function inCitySquares(x, z) {
+  return (Math.abs(x) <= CITY_HALF + 2 && Math.abs(z) <= CITY_HALF + 2) ||
+         (Math.abs(x - CITY2.x) <= CITY2.half + 2 && Math.abs(z - CITY2.z) <= CITY2.half + 2);
+}
+// додаткова висота над рельєфом під точкою: камені, бордюри, борозни, дрібна нерівність
+function bumpAt(x, z) {
+  let b = 0;
+  const sl = stoneGrid.get(cellKey(x, z, 8));
+  if (sl) for (let i = 0; i < sl.length; i++) {
+    const s = sl[i], dx = x - s.x, dz = z - s.z, d2 = dx * dx + dz * dz, r2 = s.r * s.r;
+    if (d2 < r2) { const v = s.h * Math.sqrt(1 - d2 / r2); if (v > b) b = v; }
+  }
+  const rl = rectGrid.get(cellKey(x, z, 16));
+  if (rl) for (let i = 0; i < rl.length; i++) { const v = rectBump(rl[i], x, z); if (v > b) b = v; }
+  if (!inCitySquares(x, z) && roadDistAt(x, z) > 7) {
+    b += (vnoise(x * 1.3, z * 1.3) - 0.5) * 0.07 + (vnoise(x / 5, z / 5) - 0.5) * 0.12;
+  }
+  return b;
+}
+function groundAt(x, z) { return H(x, z) + bumpAt(x, z); }
+
+function generateStones() {
+  const rnd = mulberry(4242), list = [];
+  for (let t = 0; t < 16000 && list.length < 2600; t++) {
+    const x = (rnd() * 2 - 1) * (WORLD_HALF - 30), z = (rnd() * 2 - 1) * (WORLD_HALF - 30);
+    if (Math.abs(x) < 190 && Math.abs(z) < 190) continue;
+    if (SITES.some(s => Math.hypot(x - s.x, z - s.z) < s.r)) continue;
+    if (MEADOWS.some(m => Math.hypot(x - m.x, z - m.z) < m.r + 5)) continue;
+    if (waterDepthAt(x, z) > 0.05) continue;
+    const gx = H(x + 2, z) - H(x - 2, z), gz = H(x, z + 2) - H(x, z - 2);
+    const g = Math.hypot(gx, gz) / 4, rd = roadDistAt(x, z);
+    let p = smooth(0.15, 0.55, g) * 0.9 + (nearWater(x, z) ? 0.5 : 0) + 0.03;
+    if (rd < 7.5) p = rd > 6.3 ? 0.25 : 0;
+    if (rnd() > p) continue;
+    list.push({ x, z, r: 0.35 + rnd() * rnd() * 1.1, h: 0.1 + rnd() * 0.32 });
+  }
+  for (let i = 0; i < 14; i++) {                 // каменепад на гірській дорозі
+    const s = 30 + rnd() * 440;
+    list.push({ x: pathX(s) + (rnd() - 0.5) * 8, z: -180 - s, r: 0.4 + rnd() * 0.5, h: 0.15 + rnd() * 0.25 });
+  }
+  return list;
+}
+
 const SURF_ROAD = 0, SURF_GRASS = 1, SURF_SNOW = 2, SURF_WATER = 3, SURF_SAND = 4;
 function surfaceAt(x, z) {
   if (Math.abs(x) <= CITY_HALF + 1 && Math.abs(z) <= CITY_HALF + 1) {
     for (const p of ROAD_LINES) if (Math.abs(x - p) < 6.5 || Math.abs(z - p) < 6.5) return SURF_ROAD;
     return SURF_GRASS;
   }
+  if (Math.abs(x - CITY2.x) <= CITY2.half + 1 && Math.abs(z - CITY2.z) <= CITY2.half + 1) return SURF_ROAD;
+  if (roadDistAt(x, z) < ROAD_HALF_W - 0.5) return SURF_ROAD;
   if (z < -175) { const s = -z - 180; if (Math.abs(x - pathX(s)) < 5.5) return SURF_ROAD; }
   if (waterDepthAt(x, z) > 0.15) return SURF_WATER;
   if (sandAt(x, z)) return SURF_SAND;
@@ -392,11 +604,18 @@ function makeCity() {
     const gv = new THREE.BoxGeometry(13, .08, CITY_HALF * 2); scaleUV(gv, 2, 60);
     const vertical = new THREE.Mesh(gv, roadMat);
     vertical.position.set(p, -.03, 0); vertical.receiveShadow = true; scene.add(vertical);
-    for (const off of [-8.2, 8.2]) {
-      const a = new THREE.Mesh(new THREE.BoxGeometry(CITY_HALF * 2, .22, 2.2), sidewalkMat);
-      a.position.set(0, .02, p + off); a.receiveShadow = true; scene.add(a);
-      const b = new THREE.Mesh(new THREE.BoxGeometry(2.2, .22, CITY_HALF * 2), sidewalkMat);
-      b.position.set(p + off, .02, 0); b.receiveShadow = true; scene.add(b);
+    const gaps = []; let cur = -CITY_HALF;
+    for (const q of ROAD_LINES) { gaps.push([cur, q - 6.5]); cur = q + 6.5; }
+    gaps.push([cur, CITY_HALF]);
+    for (const off of [-8.2, 8.2]) for (const [g0, g1] of gaps) {
+      if (g1 - g0 < 1) continue;
+      const len = g1 - g0, mid = (g0 + g1) / 2;
+      const a = new THREE.Mesh(new THREE.BoxGeometry(len, .22, 2.2), sidewalkMat);
+      a.position.set(mid, .02, p + off); a.receiveShadow = true; scene.add(a);
+      addBumpRect({ x0: g0, x1: g1, z0: p + off - 1.1, z1: p + off + 1.1, h: 0.13, kind: 'curb' });
+      const b = new THREE.Mesh(new THREE.BoxGeometry(2.2, .22, len), sidewalkMat);
+      b.position.set(p + off, .02, mid); b.receiveShadow = true; scene.add(b);
+      addBumpRect({ x0: p + off - 1.1, x1: p + off + 1.1, z0: g0, z1: g1, h: 0.13, kind: 'curb' });
     }
   }
 
@@ -466,7 +685,12 @@ function buildTerrain() {
   const geo = new THREE.PlaneGeometry(SIZE, SIZE, SEG, SEG);
   geo.rotateX(-Math.PI / 2);
   const pos = geo.attributes.position;
-  for (let i = 0; i < pos.count; i++) pos.setY(i, H(pos.getX(i), pos.getZ(i)) - 0.13);
+  const hs = new Float32Array(pos.count);
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), z = pos.getZ(i), h0 = H(x, z);
+    hs[i] = h0;
+    pos.setY(i, h0 - 0.13 * (1 - smooth(185, 200, Math.max(Math.abs(x), Math.abs(z)))));   // всередині міста нижче доріг
+  }
   geo.computeVertexNormals();
   scaleUV(geo, SIZE / 9, SIZE / 9);
 
@@ -477,7 +701,7 @@ function buildTerrain() {
   const cSand = new THREE.Color(0xe0cf9f), cGravel = new THREE.Color(0x8b857a), cBed = new THREE.Color(0x3d5b57);
   const c = new THREE.Color();
   for (let i = 0; i < pos.count; i++) {
-    const x = pos.getX(i), z = pos.getZ(i), h = pos.getY(i) + 0.13;
+    const x = pos.getX(i), z = pos.getZ(i), h = hs[i];
     const slope = 1 - nor.getY(i);
     c.copy(cGrass);
     c.lerp(cForest, smooth(3, 35, h) * 0.8);
@@ -503,6 +727,8 @@ function buildTerrain() {
       riverQuery(rv, x, z);
       if (_rqD < 9) { c.lerp(cGravel, 1 - smooth(4, 9, _rqD)); if (_rqD < RIVER_HALF) c.lerp(cBed, (1 - smooth(2, RIVER_HALF, _rqD)) * 0.7); }
     }
+    const rdist = roadDistAt(x, z);
+    if (rdist < 10) c.lerp(cGravel, (1 - smooth(6.5, 10, rdist)) * 0.6);
     c.multiplyScalar(0.88 + vnoise(x / 6, z / 6) * 0.24);
     colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b;
   }
@@ -513,7 +739,7 @@ function buildTerrain() {
 
   // асфальтова стрічка гірської дороги з розміткою
   const pts = [];
-  for (let s = -8; s <= 520; s += 2) {
+  for (let s = 12; s <= 520; s += 2) {
     const x = pathX(s), z = -180 - s;
     const dxds = s > 0 ? (28 / 70) * Math.cos(s / 70) : 0;
     const len = Math.hypot(1, dxds);
@@ -555,6 +781,7 @@ function makePines() {
     if (Math.abs(x) < 195 && Math.abs(z) < 195) continue;
     if (MEADOWS.some(m => Math.hypot(x - m.x, z - m.z) < m.r + 8)) continue;
     if (nearWater(x, z)) continue;
+    if (SITES.some(m => Math.hypot(x - m.x, z - m.z) < m.r + 12) || roadDistAt(x, z) < 14) continue;
     if (z < -170 && Math.abs(x - pathX(-z - 180)) < 14) continue;
     const h = H(x, z);
     if (h < 1 || h > 64) continue;
@@ -630,6 +857,10 @@ function makeSnow() {
 const DRIVER_X = -0.45;
 const CABIN_EYE = new V3(DRIVER_X, 1.4, 0.22);
 const WHEEL_R = 0.46;
+const TIRE_MAT = mat(0x141517, 0.9, 0.05);
+const wheelRefs = [];                                   // порядок: FL, RL, FR, RR
+let carBodyMat = null, carGlassMat = null;
+const mudMat = new THREE.MeshStandardMaterial({ color: 0x4d3b27, roughness: 1, transparent: true, opacity: 0, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
 const spinners = [], frontPivots = [], hands = [], driverBits = [];
 let steerPivot, steerWheel, carMesh;
 
@@ -638,7 +869,7 @@ function makeWheel(parent, side, x, z, steerable) {
   pivot.position.set(x, WHEEL_R, z);
   const spin = new THREE.Group();
   pivot.add(spin);
-  const tireMat = mat(0x141517, 0.9, 0.05), rimMat = mat(0xb4babd, 0.35, 0.85), nutMat = mat(0x303438, 0.5, 0.8);
+  const tireMat = TIRE_MAT, rimMat = mat(0xb4babd, 0.35, 0.85), nutMat = mat(0x303438, 0.5, 0.8);
   const tire = new THREE.Mesh(new THREE.CylinderGeometry(WHEEL_R, WHEEL_R, 0.32, 28), tireMat);
   tire.rotation.z = Math.PI / 2; tire.castShadow = true; spin.add(tire);
   for (let i = 0; i < 18; i++) {
@@ -659,7 +890,7 @@ function makeWheel(parent, side, x, z, steerable) {
     spin.add(nut);
   }
   parent.add(pivot);
-  spinners.push(spin);
+  spinners.push(spin); wheelRefs.push({ pivot });
   if (steerable) frontPivots.push(pivot);
 }
 
@@ -676,6 +907,7 @@ function makeHand(side) {
 function makeCar() {
   carMesh = new THREE.Group();
   const bodyMat = new THREE.MeshPhysicalMaterial({ color: 0x4b6b2e, metalness: 0.3, roughness: 0.4, clearcoat: 1, clearcoatRoughness: 0.15 });
+  carBodyMat = bodyMat;
   const darkMat = mat(0x15181b, 0.6, 0.3);
   const steelMat = mat(0x2a2e32, 0.4, 0.7);
   const floorMat = mat(0x23272a, 0.9);
@@ -687,6 +919,16 @@ function makeCar() {
   const amberMat = new THREE.MeshStandardMaterial({ color: 0xffa52a, emissive: 0x6b3d00 });
   const tailMat = new THREE.MeshStandardMaterial({ color: 0xb01a1a, emissive: 0x500808 });
   const jeepGlass = new THREE.MeshStandardMaterial({ color: 0x9fc4d4, roughness: 0.1, metalness: 0.2, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false });
+
+  carGlassMat = jeepGlass;
+  mudMat.alphaMap = canvasTex(128, (g, n) => {
+    g.fillStyle = '#7a7a7a'; g.fillRect(0, 0, n, n);
+    for (let i = 0; i < 260; i++) { const v = 150 + Math.random() * 105; g.fillStyle = `rgb(${v},${v},${v})`; g.beginPath(); g.arc(Math.random() * n, Math.random() * n, 2 + Math.random() * 9, 0, 6.3); g.fill(); }
+  }, false);
+  for (const sd of [-1, 1]) box(carMesh, .03, .3, 2.55, mudMat, sd * .965, .63, .65, false);
+  box(carMesh, 1.3, .26, .03, mudMat, 0, .7, -2.13, false);
+  box(carMesh, 1.8, .24, .03, mudMat, 0, .68, 2.015, false);
+  box(carMesh, 1.5, .02, 1.3, mudMat, 0, 1.16, -1.38, false);
 
   box(carMesh, 1.8, .1, 3.9, floorMat, 0, .5, .08);
   box(carMesh, 1.5, .5, 1.4, bodyMat, 0, .8, -1.35);
@@ -788,6 +1030,7 @@ function makeCar() {
   driverBits.push(torso, head, hair);
 
   scene.add(carMesh);
+  applyDirt(true);
 }
 
 // ================================================================ трафік (у місті)
@@ -804,6 +1047,30 @@ function addTraffic() {
     const t2 = t.clone(); t2.position.x = .52; g.add(t2);
     scene.add(g);
     traffic.push({ mesh: g, lane: i % 2 === 0 ? -30 : 30, z: -145 + i * 34, speed: 7 + (i % 4) * 2, direction: i % 2 === 0 ? 1 : -1 });
+  }
+}
+
+const traffic2 = [];
+function makeTrafficCar(color) {
+  const g = new THREE.Group(), c = mat(color, .35, .25);
+  box(g, 1.8, .55, 3.7, c, 0, .65, 0);
+  box(g, 1.45, .55, 1.7, glassMat, 0, 1.16, -.15);
+  const t = new THREE.Mesh(new THREE.BoxGeometry(.34, .12, .05), mat(0xffe8ad));
+  t.position.set(-.52, .78, -1.88); g.add(t);
+  const t2 = t.clone(); t2.position.x = .52; g.add(t2);
+  scene.add(g); return g;
+}
+function addTraffic2(lanes) {
+  const colors = [0x355b78, 0xd2d0c7, 0x202326, 0x7a8d6b, 0xb3a18a, 0x9a3b34, 0x3b5f9a];
+  lanes.forEach((ln, i) => traffic2.push({ ...ln, mesh: makeTrafficCar(colors[i % colors.length]), t: ln.start * (ln.max - ln.min) }));
+}
+function updateTraffic2(dt) {
+  for (const c of traffic2) {
+    const len = c.max - c.min;
+    c.t = (c.t + c.speed * dt) % len;
+    const v = c.dir > 0 ? c.min + c.t : c.max - c.t;
+    if (c.axis === 'x') { c.mesh.position.set(v, 0.05, c.fixed); c.mesh.rotation.y = c.dir > 0 ? -Math.PI / 2 : Math.PI / 2; }
+    else { c.mesh.position.set(c.fixed, 0.05, v); c.mesh.rotation.y = c.dir > 0 ? Math.PI : 0; }
   }
 }
 
@@ -884,7 +1151,8 @@ function spawnAnimals() {
     ['deer', 'deer', 'cow', 'cow', 'sheep']
   ];
   MEADOWS.forEach((m, mi) => {
-    plan[mi % plan.length].forEach((type, k) => {
+    const list = m.animals || plan[mi % plan.length];
+    list.forEach((type, k) => {
       const a = makeAnimal(type);
       const ang = rnd() * Math.PI * 2, rr = Math.sqrt(rnd()) * m.r * 0.8;
       const x = m.x + Math.cos(ang) * rr, z = m.z + Math.sin(ang) * rr;
@@ -892,7 +1160,7 @@ function spawnAnimals() {
       scene.add(a.g);
       animals.push({
         g: a.g, legs: a.legs, meadow: m, x, z, heading: rnd() * 6.28, speed: 0, walk: a.walk * (0.8 + rnd() * 0.4), run: a.run,
-        tx: x, tz: z, hasTarget: false, wait: rnd() * 4, phase: rnd() * 6, rank: k / plan[mi % plan.length].length
+        tx: x, tz: z, hasTarget: false, wait: rnd() * 4, phase: rnd() * 6, rank: k / list.length
       });
     });
   });
@@ -1185,6 +1453,22 @@ function buildWater() {
 
 // ================================================================ каміння біля води
 let rocks = null;
+const rockBalls = [];
+function makeStones() {
+  const list = generateStones();
+  for (const st of list) addStone(st);
+  const im = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1, 1), new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, flatShading: true }), list.length);
+  const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler(), p = new V3(), sc = new V3(), col = new THREE.Color(), rnd = mulberry(99);
+  list.forEach((st, i) => {
+    const h0 = H(st.x, st.z);
+    q.setFromEuler(e.set(0, rnd() * 6.28, 0));
+    im.setMatrixAt(i, m4.compose(p.set(st.x, h0, st.z), q, sc.set(st.r * (0.95 + rnd() * 0.15), st.h * 1.05, st.r * (0.95 + rnd() * 0.15))));
+    const sn = snowMask(st.x, st.z, h0);
+    im.setColorAt(i, col.setHSL(0.08 + rnd() * 0.04, 0.06, 0.28 + rnd() * 0.22 + sn * 0.4));
+  });
+  im.castShadow = false; im.receiveShadow = true; im.frustumCulled = false;
+  scene.add(im);
+}
 function makeRocks() {
   const rnd = mulberry(77), list = [];
   for (const rv of RIVERS) {
@@ -1208,6 +1492,11 @@ function makeRocks() {
       const a = rnd() * 6.28, r = l.r + rnd() * 10;
       list.push({ x: l.x + Math.cos(a) * r, z: l.z + Math.sin(a) * r, s: 0.5 + rnd() * rnd() * 2 });
     }
+  }
+  rockBalls.length = 0;
+  for (const r of list) {
+    if (r.s < 0.9) addStone({ x: r.x, z: r.z, r: r.s * 1.05, h: r.s * 0.5 });
+    else rockBalls.push({ x: r.x, z: r.z, r: r.s * 0.95 });
   }
   rocks = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1, 1), new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, flatShading: true }), list.length);
   const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler(), p = new V3(), sc = new V3(), col = new THREE.Color();
@@ -1294,6 +1583,10 @@ async function initPhysics() {
     const body = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(b.x, b.y, b.z));
     world.createCollider(RAPIER.ColliderDesc.cuboid(b.hx, b.hy, b.hz).setFriction(0.1), body);
   }
+  for (const r of rockBalls) {
+    const body = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(r.x, 0.45, r.z));
+    world.createCollider(RAPIER.ColliderDesc.ball(r.r).setFriction(0.3), body);
+  }
   const desc = RAPIER.RigidBodyDesc.dynamic()
     .setTranslation(0, 0.45, 6)
     .enabledRotations(false, true, false)
@@ -1306,6 +1599,7 @@ async function initPhysics() {
 // ================================================================ керування
 const keys = new Set();
 function getInput() {
+  if (inMenu) return { gas: false, reverse: false, left: false, right: false, brake: false };
   return {
     gas: keys.has('ArrowUp') || keys.has('KeyW'),
     reverse: keys.has('ArrowDown') || keys.has('KeyS'),
@@ -1325,6 +1619,79 @@ const yawQuat = new THREE.Quaternion(), _qp = new THREE.Quaternion(), _qr = new 
 const fwd = new V3(), rightV = new V3(), AX = new V3(1, 0, 0), AZ = new V3(0, 0, 1);
 let snowAmt = 0, statusAlt = -1;
 
+// ---- підвіска: пружина-демпфер на кожне колесо (порядок FL, RL, FR, RR)
+const SU = { k: 35, c: 3.2, d0: 9.81 / 140, droop: 0.22, bump: 0.30, travel: 0.52, rp2: 1.8, rr2: 0.9 };
+const SFW = [1.375, -1.375, 1.375, -1.375], SWL = [-1.02, -1.02, 1.02, 1.02];
+const susp = { y: 0, vy: 0, p: 0, vp: 0, r: 0, vr: 0, init: false };
+const wheelOff = [0, 0, 0, 0];
+function stepSusp(S, g, dt) {
+  const n = Math.max(1, Math.ceil(dt / 0.01)), h = dt / n;
+  for (let s = 0; s < n; s++) {
+    let F = 0, TP = 0, TR = 0;
+    const sp = Math.sin(S.p), sr = Math.sin(S.r);
+    for (let i = 0; i < 4; i++) {
+      const e = g[i] - (S.y + SFW[i] * sp + SWL[i] * sr) + SU.d0;
+      if (e <= 0) continue;
+      const vw = S.vy + SFW[i] * S.vp + SWL[i] * S.vr;
+      let f = SU.k * e - SU.c * vw;
+      if (e > SU.travel) f += SU.k * 8 * (e - SU.travel);
+      f = Math.min(Math.max(f, 0), 120);
+      F += f; TP += f * SFW[i]; TR += f * SWL[i];
+    }
+    S.vy += (F - 9.81) * h; S.vp += TP / SU.rp2 * h; S.vr += TR / SU.rr2 * h;
+    S.y += S.vy * h; S.p += S.vp * h; S.r += S.vr * h;
+    if (S.p > 0.9) { S.p = 0.9; S.vp = Math.min(S.vp, 0); } else if (S.p < -0.9) { S.p = -0.9; S.vp = Math.max(S.vp, 0); }
+    if (S.r > 0.7) { S.r = 0.7; S.vr = Math.min(S.vr, 0); } else if (S.r < -0.7) { S.r = -0.7; S.vr = Math.max(S.vr, 0); }
+  }
+  const sp = Math.sin(S.p), sr = Math.sin(S.r);
+  for (let i = 0; i < 4; i++) {
+    const o = g[i] - (S.y + SFW[i] * sp + SWL[i] * sr);
+    wheelOff[i] = o < -SU.droop ? -SU.droop : (o > SU.bump ? SU.bump : o);
+  }
+}
+
+// ---- бруд: росте на бездоріжжі, змивається у воді та на мийці
+let dirt = 0, dirtShown = -1, dirtSaveT = 0, washing = false, carWash = null, statusKey = '';
+try { dirt = clamp(parseFloat(localStorage.getItem('pd_dirt')) || 0, 0, 1); } catch (e) { /* ignore */ }
+const DIRT_RATE = [0.0003, 0.007, 0.002, 0, 0.004];          // дорога, трава, сніг, вода, пісок (за секунду)
+const C_BODY0 = new THREE.Color(0x4b6b2e), C_BODY1 = new THREE.Color(0x5b4630);
+const C_TIRE0 = new THREE.Color(0x141517), C_TIRE1 = new THREE.Color(0x4d3b2a);
+const C_GL0 = new THREE.Color(0x9fc4d4), C_GL1 = new THREE.Color(0x85735c);
+function applyDirt(force) {
+  if (!carBodyMat || (!force && Math.abs(dirt - dirtShown) < 0.004)) return;
+  dirtShown = dirt;
+  const d = smooth(0.0, 1.0, dirt);
+  carBodyMat.color.copy(C_BODY0).lerp(C_BODY1, d * 0.8);
+  carBodyMat.roughness = mix(0.4, 0.88, d); carBodyMat.metalness = mix(0.3, 0.08, d);
+  carBodyMat.clearcoat = mix(1, 0.12, d);
+  TIRE_MAT.color.copy(C_TIRE0).lerp(C_TIRE1, d);
+  carGlassMat.color.copy(C_GL0).lerp(C_GL1, d * 0.7); carGlassMat.opacity = mix(0.22, 0.5, d);
+  mudMat.opacity = smooth(0.1, 0.85, dirt) * 0.95;
+}
+function updateDirt(dt, surf, fs, x, z) {
+  washing = false;
+  const sp = Math.abs(fs);
+  if (surf === SURF_WATER && waterDepthAt(x, z) > 0.3) { dirt -= 0.3 * dt; washing = true; }
+  else if (carWash && Math.abs(x - carWash.x) < carWash.hx && Math.abs(z - carWash.z) < carWash.hz) { dirt -= 0.4 * dt; washing = true; }
+  else if (sp > 0.3) dirt += DIRT_RATE[surf] * dt * (0.3 + Math.min(1, sp / 12) * 0.7);
+  dirt = clamp(dirt, 0, 1);
+  applyDirt();
+  dirtSaveT += dt;
+  if (dirtSaveT > 3) { dirtSaveT = 0; try { localStorage.setItem('pd_dirt', dirt.toFixed(3)); } catch (e) { /* ignore */ } }
+}
+
+// ---- висоти ґрунту під колесами (рельєф + камені, бордюри, борозни)
+const GH = [0, 0, 0, 0], HH = [0, 0, 0, 0], BMP = [0, 0, 0, 0];
+const WFW = [1.4, -1.35, 1.4, -1.35], WLX = [-1.02, -1.02, 1.02, 1.02];
+function wheelGround(x, z, f, r) {
+  for (let i = 0; i < 4; i++) {
+    const cx = x + f.x * WFW[i] + r.x * WLX[i], cz = z + f.z * WFW[i] + r.z * WLX[i];
+    const h = H(cx, cz);
+    const b = Math.max(bumpAt(cx, cz), bumpAt(cx + f.x * 0.32, cz + f.z * 0.32), bumpAt(cx - f.x * 0.32, cz - f.z * 0.32));
+    HH[i] = h; BMP[i] = b; GH[i] = h + b;
+  }
+}
+
 function sampleH(cx, cz, f, r, l, fw) { return H(cx + f.x * fw + r.x * l, cz + f.z * fw + r.z * l); }
 
 function updateCar(dt) {
@@ -1341,9 +1708,12 @@ function updateCar(dt) {
   // поверхня і схил
   const surf = surfaceAt(p0.x, p0.z);
   const grip = GRIP[surf], accMul = ACCM[surf];
-  const hF = (sampleH(p0.x, p0.z, fwd, rightV, -1.02, 1.4) + sampleH(p0.x, p0.z, fwd, rightV, 1.02, 1.4)) / 2;
-  const hR = (sampleH(p0.x, p0.z, fwd, rightV, -1.02, -1.35) + sampleH(p0.x, p0.z, fwd, rightV, 1.02, -1.35)) / 2;
-  const slopeAlong = (hF - hR) / 2.75;
+  wheelGround(p0.x, p0.z, fwd, rightV);
+  const hF = (HH[0] + HH[2]) / 2, hR = (HH[1] + HH[3]) / 2;
+  const bSlope = clamp(((GH[0] + GH[2]) / 2 - hF - ((GH[1] + GH[3]) / 2 - hR)) / 2.75, -0.6, 0.6);
+  const slopeAlong = (hF - hR) / 2.75 + 0.5 * bSlope;
+  const rough = Math.max(BMP[0], BMP[1], BMP[2], BMP[3]) - Math.min(BMP[0], BMP[1], BMP[2], BMP[3]);
+  updateDirt(dt, surf, fs, p0.x, p0.z);
   const gAlong = -9.81 * slopeAlong / Math.sqrt(1 + slopeAlong * slopeAlong);
 
   // кермо
@@ -1358,6 +1728,7 @@ function updateCar(dt) {
   else if (input.reverse && !input.gas) a = fs > 0.5 ? -BRAKE : -ACC_REV * accMul * Math.max(0, 1 + fs / VREV);
   const pedal = input.gas !== input.reverse;
   fs -= fs * (pedal ? 0.1 : 0.45) * dt;
+  fs -= fs * Math.min(rough, 0.5) * 0.9 * dt;           // нерівності гальмують
   if (surf === SURF_WATER) {                     // вода гальмує, у глибокій машина застрягає
     const wd = waterDepthAt(p0.x, p0.z);
     fs *= Math.exp(-(0.5 + Math.min(wd, 2.5) * 0.9 + (wd > 1.8 ? 4 : 0)) * dt);
@@ -1389,18 +1760,14 @@ function updateCar(dt) {
   fwd.set(0, 0, -1).applyQuaternion(yawQuat);
   rightV.set(1, 0, 0).applyQuaternion(yawQuat);
 
-  // положення і нахил кузова по рельєфу
-  const hFL = sampleH(p.x, p.z, fwd, rightV, -1.02, 1.4), hFR = sampleH(p.x, p.z, fwd, rightV, 1.02, 1.4);
-  const hRL = sampleH(p.x, p.z, fwd, rightV, -1.02, -1.35), hRR = sampleH(p.x, p.z, fwd, rightV, 1.02, -1.35);
-  const groundY = (hFL + hFR + hRL + hRR) / 4;
-  const pitchT = clamp(Math.atan(((hFL + hFR) - (hRL + hRR)) / 2 / 2.75), -0.9, 0.9);
-  const rollT = clamp(Math.atan(((hFR + hRR) - (hFL + hRL)) / 2 / 2.04), -0.7, 0.7);
-  const k = 1 - Math.exp(-12 * dt);
-  if (!groundInit) { groundYS = groundY; groundInit = true; }
-  groundYS += (groundY - groundYS) * (1 - Math.exp(-20 * dt));
-  pitchS += (pitchT - pitchS) * k; rollS += (rollT - rollS) * k;
-  carMesh.position.set(p.x, groundYS, p.z);
-  carMesh.quaternion.copy(yawQuat).multiply(_qp.setFromAxisAngle(AX, pitchS)).multiply(_qr.setFromAxisAngle(AZ, rollS));
+  // кузов на пружинах: підвіска, перекіс і підйом коліс на нерівностях
+  wheelGround(p.x, p.z, fwd, rightV);
+  if (!susp.init) { susp.init = true; susp.y = (GH[0] + GH[1] + GH[2] + GH[3]) / 4; }
+  stepSusp(susp, GH, dt);
+  const groundY = (HH[0] + HH[1] + HH[2] + HH[3]) / 4;
+  carMesh.position.set(p.x, susp.y, p.z);
+  carMesh.quaternion.copy(yawQuat).multiply(_qp.setFromAxisAngle(AX, susp.p)).multiply(_qr.setFromAxisAngle(AZ, susp.r));
+  for (let i = 0; i < 4; i++) if (wheelRefs[i]) wheelRefs[i].pivot.position.y = WHEEL_R + wheelOff[i];
 
   wheelRot -= fs * dt / WHEEL_R;
   for (const s of spinners) s.rotation.x = wheelRot;
@@ -1418,7 +1785,8 @@ function updateCar(dt) {
   gearEl.textContent = fs < -0.3 || (input.reverse && speedKmh < 2) ? 'R' : (speedKmh < 2 ? 'N' : 'D');
 
   const alt = Math.round(groundY);
-  if (alt !== statusAlt) { statusAlt = alt; statusEl.textContent = `JEEP · ${alt} м`; }
+  const key = alt + '|' + Math.round(dirt * 100) + '|' + (washing ? 1 : 0);
+  if (key !== statusKey) { statusKey = key; statusEl.textContent = `JEEP · ${alt} м · БРУД ${Math.round(dirt * 100)}%${washing ? ' · МИЙКА' : ''}`; }
   return { x: p.x, z: p.z, speed: Math.hypot(v2.x, v2.z) };
 }
 
@@ -1480,7 +1848,13 @@ function updateWeather(dt, cx, cz) {
 const _c = new V3(), _q = new THREE.Quaternion(), _eu = new THREE.Euler(0, 0, 0, 'YXZ'), _tp = new V3();
 function updateCamera(dt, cx, cz) {
   const cp = carMesh.position;
-  if (cameraMode === 0) {
+  if (inMenu) {
+    menuT += dt;
+    const a = menuT * 0.16 + 0.6;
+    _tp.set(cp.x + Math.sin(a) * 7.5, cp.y + 2.1 + Math.sin(menuT * 0.3) * 0.3, cp.z + Math.cos(a) * 7.5);
+    camera.position.lerp(_tp, 1 - Math.exp(-3 * dt));
+    camera.lookAt(cp.x, cp.y + 0.9, cp.z);
+  } else if (cameraMode === 0) {
     const off = _c.set(0, 3.8, 8.2).applyQuaternion(yawQuat);
     _tp.set(cp.x + off.x, cp.y + off.y, cp.z + off.z);
     _tp.y = Math.max(_tp.y, H(_tp.x, _tp.z) + 1.2);
@@ -1503,6 +1877,8 @@ function animate() {
   if (ready && dt > 0) {
     const c = updateCar(dt);
     updateTraffic(dt);
+    updateTraffic2(dt);
+    for (const f of worldUpdates) f(dt, clock.elapsedTime);
     updateAnimals(dt, c.x, c.z, c.speed);
     updateCamera(dt, c.x, c.z);
     updateWeather(dt, c.x, c.z);
@@ -1527,7 +1903,7 @@ function applyQuality() {
     for (const k of ['trunk', 'c1', 'c2']) { pines[k].count = n; pines[k].castShadow = q.castTrees; }
   }
   animals.forEach(a => { a.g.visible = a.rank < q.animals; });
-  qualityBtn.textContent = 'ГРАФІКА · ' + q.label;
+  refreshQualityUI();
 }
 
 // ================================================================ події
@@ -1577,14 +1953,35 @@ function bindControls() {
   wheelEl.addEventListener('lostpointercapture', release);
 
   cameraBtn.addEventListener('click', toggleCamera);
-  qualityBtn.addEventListener('click', () => {
-    const order = ['high', 'mid', 'low'];
-    qualityKey = order[(order.indexOf(qualityKey) + 1) % order.length];
+  document.querySelectorAll('#qualitySeg button').forEach(b => b.addEventListener('click', () => {
+    qualityKey = b.dataset.q;
     try { localStorage.setItem('pd_quality', qualityKey); } catch (e) { /* ignore */ }
     applyQuality();
-  });
+  }));
+  document.querySelector('#gearBtn').addEventListener('click', () => settingsEl.classList.remove('hidden'));
+  document.querySelector('#closeSettings').addEventListener('click', () => settingsEl.classList.add('hidden'));
+  settingsEl.addEventListener('click', e => { if (e.target === settingsEl) settingsEl.classList.add('hidden'); });
+  document.querySelector('#playBtn').addEventListener('click', () => setMenu(false));
+  menuBtn.addEventListener('click', () => setMenu(true));
+  // кнопка «Мультиплеєр (P2P)» поки без функціоналу
 }
 
+const QNOTE = {
+  high: 'Максимальна якість: тіні 4096, повна щільність дерев і тварин, сніг, чіткість до 2×. Для потужних телефонів і ПК.',
+  mid: 'Баланс: тіні 2048, половина дерев, менше тварин і снігу. Підходить більшості телефонів.',
+  low: 'Максимальна швидкість: тіні 1024, мало дерев і тварин, чіткість 1×. Для слабких пристроїв.'
+};
+function refreshQualityUI() {
+  document.querySelectorAll('#qualitySeg button').forEach(b => b.classList.toggle('on', b.dataset.q === qualityKey));
+  const n = document.querySelector('#qualityNote'); if (n) n.textContent = QNOTE[qualityKey];
+}
+function setMenu(on) {
+  inMenu = on;
+  document.body.classList.toggle('in-menu', on);
+  keys.clear(); touchSteer = null;
+  if (on) { camera.fov = 55; camera.updateProjectionMatrix(); for (const b of driverBits) b.visible = true; }
+  else applyCameraMode();
+}
 function toggleCamera() { cameraMode = 1 - cameraMode; applyCameraMode(); }
 function applyCameraMode() {
   cameraBtn.textContent = cameraMode === 0 ? 'КАМЕРА · ЗЗАДУ' : 'КАМЕРА · САЛОН';
@@ -1602,9 +1999,20 @@ addEventListener('resize', () => {
   mistU.uPR.value = renderer.getPixelRatio();
 });
 
+const worldUpdates = [];
+function safe(name, fn) { try { return fn(); } catch (e) { console.error('[build:' + name + ']', e); } }
+
 async function start() {
-  buildTerrain(); buildWater(); makeCity(); makePines(); makeBeach(); makeRocks(); makeMist(); makeSnow(); makeCar(); addTraffic(); spawnAnimals(); makeTracks();
-  bindControls(); applyCameraMode(); applyQuality();
+  buildTerrain(); buildWater(); makeCity();
+  const w2 = { scene, mat, box, bar, mulberry, scaleUV, asphaltTex, wallMat, roofMat, buildingBoxes, addBumpRect, ROADS, CITY2, FARM };
+  safe('roads', () => buildRoadMeshes(w2));
+  safe('city2', () => {
+    const c2 = buildCity2(w2);
+    carWash = c2.wash; worldUpdates.push(...c2.update); addTraffic2(c2.traffic);
+  });
+  safe('farm', () => { const f = buildFarm(w2); worldUpdates.push(...f.update); });
+  makePines(); makeBeach(); makeRocks(); safe('stones', makeStones); makeMist(); makeSnow(); makeCar(); addTraffic(); spawnAnimals(); makeTracks();
+  bindControls(); applyQuality(); setMenu(true);
   await initPhysics();
   ready = true;
   loading.style.opacity = '0';
