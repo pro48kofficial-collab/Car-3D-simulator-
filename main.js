@@ -3,6 +3,9 @@ import RAPIER from '@dimforge/rapier3d-compat';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import './style.css';
 import { buildRoadMeshes, buildCity2, buildFarm } from './world2.js';
+import { createMenuScene } from './menuscene.js';
+import { Net } from './net.js';
+import { buildJeep, makeNameTag, SLOT_COLORS } from './jeep.js';
 
 const game = document.querySelector('#game');
 const loading = document.querySelector('#loading');
@@ -13,7 +16,7 @@ const cameraBtn = document.querySelector('#cameraBtn');
 const menuBtn = document.querySelector('#menuBtn');
 const menuEl = document.querySelector('#menu');
 const settingsEl = document.querySelector('#settings');
-let inMenu = true, menuT = 0;
+let inMenu = true, menuT = 0, menuView = null;
 const statusEl = document.querySelector('.status');
 
 const V3 = THREE.Vector3;
@@ -1787,7 +1790,7 @@ function updateCar(dt) {
   const alt = Math.round(groundY);
   const key = alt + '|' + Math.round(dirt * 100) + '|' + (washing ? 1 : 0);
   if (key !== statusKey) { statusKey = key; statusEl.textContent = `JEEP · ${alt} м · БРУД ${Math.round(dirt * 100)}%${washing ? ' · МИЙКА' : ''}`; }
-  return { x: p.x, z: p.z, speed: Math.hypot(v2.x, v2.z) };
+  return { x: p.x, z: p.z, speed: Math.hypot(v2.x, v2.z), fs };
 }
 
 const _h = new V3(), _e = new V3(), _d = new V3();
@@ -1874,8 +1877,15 @@ const clock = new THREE.Clock();
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), .05);
+  if (inMenu && menuView) {
+    menuView.update(dt, clock.elapsedTime);
+    renderer.render(menuView.scene, menuView.camera);
+    return;
+  }
   if (ready && dt > 0) {
     const c = updateCar(dt);
+    updateRemotes(dt);
+    sendNetState(dt, c);
     updateTraffic(dt);
     updateTraffic2(dt);
     for (const f of worldUpdates) f(dt, clock.elapsedTime);
@@ -1909,6 +1919,7 @@ function applyQuality() {
 // ================================================================ події
 function bindControls() {
   addEventListener('keydown', e => {
+    if (e.target && e.target.tagName === 'INPUT') return;
     if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
     keys.add(e.code);
     if (e.code === 'KeyC' && !e.repeat) toggleCamera();
@@ -1962,8 +1973,134 @@ function bindControls() {
   document.querySelector('#closeSettings').addEventListener('click', () => settingsEl.classList.add('hidden'));
   settingsEl.addEventListener('click', e => { if (e.target === settingsEl) settingsEl.classList.add('hidden'); });
   document.querySelector('#playBtn').addEventListener('click', () => setMenu(false));
-  menuBtn.addEventListener('click', () => setMenu(true));
+  menuBtn.addEventListener('click', () => { if (mpActive) endSession(); setMenu(true); });
+  bindMultiplayerUI();
   // кнопка «Мультиплеєр (P2P)» поки без функціоналу
+}
+
+
+// ================================================================ мультиплеєр (WebRTC + публічні MQTT-брокери, без власного сервера)
+const nickIn = document.querySelector('#nickIn');
+let nick = '';
+try { nick = (localStorage.getItem('pd_nick') || '').slice(0, 14); } catch (e) { /* ignore */ }
+if (!nick) nick = 'Гравець' + (100 + Math.floor(Math.random() * 900));
+nickIn.value = nick;
+const getNick = () => (nickIn.value.replace(/[<>]/g, '').trim().slice(0, 14)) || nick;
+const net = new Net((type, d) => onNet(type, d));
+const remotes = new Map();
+let mpActive = false, netT = 0;
+const playersEl = document.querySelector('#players'), toastEl = document.querySelector('#toast');
+const mpEl = document.querySelector('#mp'), netStatusEl = document.querySelector('#netStatus'), srvListEl = document.querySelector('#srvList'), mpErrEl = document.querySelector('#mpErr');
+const SPAWNS = [[0, 6], [-6, 10], [6, 10], [-12, 6], [12, 6]];
+let toastTimer = 0;
+function showToast(t) { toastEl.textContent = t; toastEl.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => toastEl.classList.remove('show'), 3200); }
+
+function onNet(type, d) {
+  if (type === 'status') netStatusEl.textContent = d;
+  else if (type === 'servers') renderServers(d);
+  else if (type === 'roster') syncRoster(d);
+  else if (type === 'state') applyRemoteState(d);
+  else if (type === 'joined') startSession(d);
+  else if (type === 'closed') { endSession(); setMenu(true); showToast(d); }
+  else if (type === 'error') { mpErrEl.textContent = d; setBusy(false); }
+}
+function setBusy(b) { document.querySelector('#createBtn').disabled = b; srvListEl.querySelectorAll('button').forEach(x => { x.disabled = b || x.dataset.full === '1'; }); }
+function renderServers(list) {
+  srvListEl.innerHTML = '';
+  if (!list.length) { srvListEl.innerHTML = '<div class="srv-empty">Серверів поки немає. Створіть свій і запросіть друзів!</div>'; return; }
+  for (const s of list) {
+    const full = s.n >= s.max, row = document.createElement('div'); row.className = 'srv';
+    const nm = document.createElement('div'); nm.className = 'nm'; nm.textContent = s.name;
+    const sub = document.createElement('small'); sub.textContent = 'хост: ' + s.host; nm.appendChild(sub);
+    const cnt = document.createElement('div'); cnt.className = 'cnt' + (full ? ' full' : ''); cnt.textContent = s.n + '/' + s.max;
+    const b = document.createElement('button'); b.textContent = full ? 'ПОВНИЙ' : 'ЗАЙТИ'; b.disabled = full; b.dataset.full = full ? '1' : '0';
+    b.addEventListener('click', () => joinServer(s.id));
+    row.append(nm, cnt, b); srvListEl.appendChild(row);
+  }
+}
+function openMP() {
+  mpEl.classList.remove('hidden'); mpErrEl.textContent = '';
+  net.connect().then(() => renderServers(net.serverList())).catch(() => { mpErrEl.textContent = 'Немає зв’язку з мережею. Перевірте інтернет.'; });
+}
+function joinServer(id) {
+  mpErrEl.textContent = ''; setBusy(true);
+  try { localStorage.setItem('pd_nick', getNick()); } catch (e) { /* ignore */ }
+  net.join(id, getNick()).catch(() => { mpErrEl.textContent = 'Не вдалося підключитися'; setBusy(false); });
+}
+function createServer() {
+  mpErrEl.textContent = ''; setBusy(true);
+  const name = document.querySelector('#srvName').value.trim() || (getNick() + ' — сервер');
+  try { localStorage.setItem('pd_nick', getNick()); } catch (e) { /* ignore */ }
+  net.host(name, getNick()).catch(() => { mpErrEl.textContent = 'Не вдалося створити сервер (немає зв’язку з мережею)'; setBusy(false); });
+}
+function bindMultiplayerUI() {
+  document.querySelector('#mpBtn').addEventListener('click', openMP);
+  document.querySelector('#mpBack').addEventListener('click', () => mpEl.classList.add('hidden'));
+  document.querySelector('#createBtn').addEventListener('click', createServer);
+  mpEl.addEventListener('click', e => { if (e.target === mpEl) mpEl.classList.add('hidden'); });
+  nickIn.addEventListener('change', () => { nick = getNick(); nickIn.value = nick; try { localStorage.setItem('pd_nick', nick); } catch (e) { /* ignore */ } });
+  addEventListener('beforeunload', () => net.leave());
+  setInterval(() => { if (!mpEl.classList.contains('hidden') && !mpActive) renderServers(net.serverList()); }, 6000);
+}
+function startSession(info) {
+  mpActive = true; setBusy(false);
+  mpEl.classList.add('hidden');
+  const sp = SPAWNS[info.slot % SPAWNS.length];
+  carBody.setTranslation({ x: sp[0], y: 0.45, z: sp[1] }, true); carBody.setLinvel({ x: 0, y: 0, z: 0 }, true); carBody.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+  susp.init = false; susp.vy = susp.vp = susp.vr = 0; susp.p = susp.r = 0;
+  setMenu(false);
+  showToast(info.host ? 'Сервер створено — чекаємо гравців' : 'Ви на сервері «' + (info.name || '') + '»');
+}
+function syncRoster(players) {
+  const ids = new Set(players.map(p => p.id));
+  for (const [id, r] of remotes) if (!ids.has(id)) { scene.remove(r.group); remotes.delete(id); }
+  for (const p of players) {
+    if (p.id === net.id || remotes.has(p.id)) continue;
+    const j = buildJeep(SLOT_COLORS[p.slot % SLOT_COLORS.length]);
+    j.group.add(makeNameTag(p.nick)); j.group.visible = false; scene.add(j.group);
+    remotes.set(p.id, { ...j, has: false, cur: { x: 0, y: 0, z: 0, yaw: 0, p: 0, r: 0 }, tgt: null });
+  }
+  playersEl.style.display = mpActive || net.role ? 'block' : 'none';
+  playersEl.innerHTML = '';
+  for (const p of players) {
+    const d = document.createElement('div');
+    const dot = document.createElement('span'); dot.className = 'dot'; dot.style.background = '#' + SLOT_COLORS[p.slot % SLOT_COLORS.length].toString(16).padStart(6, '0');
+    d.append(dot, document.createTextNode(p.nick + (p.id === net.id ? ' (ви)' : '') + (p.slot === 0 ? ' ★' : '')));
+    playersEl.appendChild(d);
+  }
+}
+function applyRemoteState(m) {
+  const r = remotes.get(m.id); if (!r) return;
+  r.tgt = m;
+  if (!r.has) { Object.assign(r.cur, { x: m.x, y: m.y, z: m.z, yaw: m.yaw, p: m.p, r: m.r }); r.has = true; r.group.visible = true; }
+}
+function endSession() {
+  mpActive = false; net.leave();
+  for (const r of remotes.values()) scene.remove(r.group);
+  remotes.clear(); playersEl.style.display = 'none';
+}
+const _rq1 = new THREE.Quaternion(), _rq2 = new THREE.Quaternion(), _rq3 = new THREE.Quaternion();
+function updateRemotes(dt) {
+  const k = 1 - Math.exp(-12 * dt);
+  for (const r of remotes.values()) {
+    if (!r.has || !r.tgt) continue;
+    const c = r.cur, t = r.tgt;
+    c.x += (t.x - c.x) * k; c.y += (t.y - c.y) * k; c.z += (t.z - c.z) * k;
+    let d = t.yaw - c.yaw; while (d > Math.PI) d -= Math.PI * 2; while (d < -Math.PI) d += Math.PI * 2;
+    c.yaw += d * k; c.p += (t.p - c.p) * k; c.r += (t.r - c.r) * k;
+    r.group.position.set(c.x, c.y, c.z);
+    r.group.quaternion.setFromAxisAngle(Y_AXIS, c.yaw).multiply(_rq2.setFromAxisAngle(AX, c.p)).multiply(_rq3.setFromAxisAngle(AZ, c.r));
+    for (const s of r.spinners) s.rotation.x -= (t.fs || 0) * dt / WHEEL_R;
+    for (const f of r.frontPivots) f.rotation.y = (t.st || 0) * 0.5;
+  }
+}
+function sendNetState(dt, c) {
+  if (!mpActive) return;
+  netT += dt;
+  if (netT < 0.05) return;
+  netT = 0;
+  const rr = carBody.rotation(), q = v => Math.round(v * 100) / 100;
+  net.sendState({ x: q(c.x), y: q(carMesh.position.y), z: q(c.z), yaw: q(2 * Math.atan2(rr.y, rr.w)), p: q(susp.p), r: q(susp.r), st: q(steerVal), fs: q(c.fs) });
 }
 
 const QNOTE = {
@@ -1997,6 +2134,7 @@ addEventListener('resize', () => {
   renderer.setPixelRatio(Math.min(devicePixelRatio, QUALITY[qualityKey].pr));
   snowUniforms.uPR.value = renderer.getPixelRatio();
   mistU.uPR.value = renderer.getPixelRatio();
+  if (menuView) menuView.resize(innerWidth, innerHeight);
 });
 
 const worldUpdates = [];
@@ -2012,6 +2150,7 @@ async function start() {
   });
   safe('farm', () => { const f = buildFarm(w2); worldUpdates.push(...f.update); });
   makePines(); makeBeach(); makeRocks(); safe('stones', makeStones); makeMist(); makeSnow(); makeCar(); addTraffic(); spawnAnimals(); makeTracks();
+  menuView = safe('menu', () => createMenuScene(scene.environment));
   bindControls(); applyQuality(); setMenu(true);
   await initPhysics();
   ready = true;
