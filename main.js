@@ -2,7 +2,9 @@ import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import './style.css';
-import { buildRoadMeshes, buildCity2, buildFarm } from './world2.js';
+import { buildRoadMeshes, buildCity2, buildFarm, FARM_FIELDS, FARM_YARD } from './world2.js';
+import { createVegetation } from './vegetation.js';
+import { CarAudio } from './audio.js';
 import { createMenuScene } from './menuscene.js';
 import { Net } from './net.js';
 import { buildJeep, makeNameTag, SLOT_COLORS } from './jeep.js';
@@ -16,7 +18,13 @@ const cameraBtn = document.querySelector('#cameraBtn');
 const menuBtn = document.querySelector('#menuBtn');
 const menuEl = document.querySelector('#menu');
 const settingsEl = document.querySelector('#settings');
-let inMenu = true, menuT = 0, menuView = null;
+let inMenu = true, menuT = 0, menuView = null, veg = null, terrainT = 0, playersT = 0;
+const audio = new CarAudio();
+const audioState = { cd: 0, inMenu: true, fs: 0, throttle: 0, brake: false, surf: 1, lat: 0, rough: 0, wading: false };
+let soundOn = true;
+try { soundOn = localStorage.getItem('pd_sound') !== '0'; } catch (e) { /* ignore */ }
+audio.setEnabled(soundOn);
+const grassCover = [];
 const statusEl = document.querySelector('.status');
 
 const V3 = THREE.Vector3;
@@ -27,9 +35,9 @@ const mix = (a, b, t) => a + (b - a) * t;
 
 // ================================================================ якість графіки
 const QUALITY = {
-  high: { label: 'ВИСОКА', pr: 2, shadow: 4096, snow: 9000, trees: 1.0, animals: 1.0, castTrees: true },
-  mid:  { label: 'СЕРЕДНЯ', pr: 1.5, shadow: 2048, snow: 4500, trees: 0.5, animals: 0.7, castTrees: false },
-  low:  { label: 'НИЗЬКА', pr: 1, shadow: 1024, snow: 1800, trees: 0.2, animals: 0.4, castTrees: false }
+  high: { label: 'ВИСОКА', pr: 2, shadow: 4096, snow: 9000, trees: 1.0, animals: 1.0, grass: 6, castTrees: true },
+  mid:  { label: 'СЕРЕДНЯ', pr: 1.5, shadow: 2048, snow: 4500, trees: 0.5, animals: 0.7, grass: 4, castTrees: false },
+  low:  { label: 'НИЗЬКА', pr: 1, shadow: 1024, snow: 1800, trees: 0.2, animals: 0.4, grass: 2, castTrees: false }
 };
 let qualityKey = 'high';
 try { const s = localStorage.getItem('pd_quality'); if (QUALITY[s]) qualityKey = s; } catch (e) { /* ignore */ }
@@ -151,7 +159,7 @@ function mulberry(seed) {
   return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
 }
 
-const WORLD_HALF = 700;
+const WORLD_HALF = 2200;                         // ≈10× площі порівняно з v0.5 (було 700)
 const ROAD_LINES = [-90, -30, 30, 90];
 const CITY_HALF = 180;
 const FARM = { x: 380, z: 10 };
@@ -169,6 +177,18 @@ const MEADOWS = [
   { x: FARM.x + 80, z: FARM.z + 20, r: 19, flat: true, animals: ['cow', 'cow', 'cow', 'cow'] },     // вигони ферми
   { x: FARM.x + 80, z: FARM.z + 62, r: 15, flat: true, animals: ['sheep', 'sheep', 'sheep', 'sheep', 'sheep'] }
 ];
+{                                                   // луки з тваринами на рівнинах нової частини карти
+  const rr = mulberry(555);
+  const spots = [[-505, -1256, 53], [145, 1049, 59], [-1336, 1973, 52], [-1023, -1397, 53], [625, 979, 60], [1600, -1837, 63], [694, -1711, 52], [-133, -2021, 60],
+    [1663, 368, 55], [-256, 980, 51], [-85, -1578, 56], [-88, -1032, 55], [2019, 561, 65], [-1040, -672, 63], [-970, 995, 63], [1275, -1592, 51]];
+  for (const [x, z, r] of spots) {
+    const list = [], n = 5 + Math.floor(rr() * 4), kinds = ['deer', 'sheep', 'cow'], main = kinds[Math.floor(rr() * 3)];
+    for (let i = 0; i < n; i++) list.push(rr() < 0.65 ? main : kinds[Math.floor(rr() * 3)]);
+    MEADOWS.push({ x, z, r, animals: list });
+  }
+}
+// поля пшениці й посівів на рівнинах (будуються у world2.js / vegetation.js)
+const FARMFIELDS = [[-1185, -1111], [-381, 1159], [1792, 521], [1187, 400], [-73, 1255], [40, 1879], [-723, 1015], [-632, -1601], [-1134, 1421], [-910, -1220], [-289, -1073], [-609, 1889]].map(([x, z]) => ({ x, z }));
 // гірська дорога на північ від міста: x = 30 + 28·sin(s/70), де s = -z - 180
 const pathX = s => 30 + 28 * Math.sin(Math.max(s, 0) / 70);
 
@@ -196,6 +216,10 @@ function baseH(x, z) {
     const dl = Math.hypot(x - LOWLAND.x, z - LOWLAND.z);
     if (dl < LOWLAND.r + 150) h *= mix(0.1, 1, smooth(LOWLAND.r, LOWLAND.r + 150, dl));
   }
+  if (d > 620) {                                   // за межами старої карти: рівнини (пасовиська, поля, озера) між гірськими регіонами
+    const bio = fbm(x / 1100 + 7.7, z / 1100 - 3.3, 3);
+    h *= mix(1, mix(0.06, 1, smooth(0.47, 0.58, bio)), smooth(620, 820, d));
+  }
   const s = -z - 180;
   if (s > 0 && s < 540) {
     const lateral = Math.abs(x - pathX(s));
@@ -209,7 +233,11 @@ function baseH(x, z) {
 const LAKES = [
   { x: -275, z: 255, r: 80, shore: 70, depth: 7, beach: true },   // пляжне озеро біля міста
   { x: -390, z: -20, r: 60, shore: 60, depth: 9 },
-  { x: -250, z: -450, r: 50, shore: 60, depth: 9 }                 // високогірне озеро — джерело річки
+  { x: -250, z: -450, r: 50, shore: 60, depth: 9 },                // високогірне озеро — джерело річки
+  { x: 1988, z: 129, r: 74, shore: 70, depth: 8 },                 // озера на рівнинах нової частини карти
+  { x: -266, z: 1973, r: 78, shore: 70, depth: 8 },
+  { x: -1451, z: 1498, r: 96, shore: 70, depth: 8 },
+  { x: 450, z: 1436, r: 85, shore: 70, depth: 8 }
 ];
 for (const l of LAKES) {
   let m = Infinity;
@@ -525,7 +553,7 @@ function groundAt(x, z) { return H(x, z) + bumpAt(x, z); }
 
 function generateStones() {
   const rnd = mulberry(4242), list = [];
-  for (let t = 0; t < 16000 && list.length < 2600; t++) {
+  for (let t = 0; t < 70000 && list.length < 9000; t++) {
     const x = (rnd() * 2 - 1) * (WORLD_HALF - 30), z = (rnd() * 2 - 1) * (WORLD_HALF - 30);
     if (Math.abs(x) < 190 && Math.abs(z) < 190) continue;
     if (SITES.some(s => Math.hypot(x - s.x, z - s.z) < s.r)) continue;
@@ -683,63 +711,113 @@ function makeCity() {
 }
 
 // ================================================================ рельєф, гірська дорога, ліс
+// ---- рельєф шматками по 200 м з двома рівнями деталізації (близько 4 м, далі 17 м), що підвантажуються навколо машини
+const CS = 200;
+const NCH = Math.round(WORLD_HALF * 2 / CS);
+const terrainMat = new THREE.MeshStandardMaterial({ vertexColors: true, map: groundTex, roughness: 1, side: THREE.DoubleSide });
+const terrainChunks = new Map();
+const cGrass = new THREE.Color(0x54733f), cMeadow = new THREE.Color(0x73a04a), cForest = new THREE.Color(0x3b5636);
+const cRock = new THREE.Color(0x7c776e), cSnow = new THREE.Color(0xf3f7fb), cDirt = new THREE.Color(0x6c5b44);
+const cSand = new THREE.Color(0xe0cf9f), cGravel = new THREE.Color(0x8b857a), cBed = new THREE.Color(0x3d5b57);
+const cPlain = new THREE.Color(0x86a84f);
+
+function terrainColorAt(x, z, h, slope, c) {
+  c.copy(cGrass);
+  c.lerp(cForest, smooth(3, 35, h) * 0.8);
+  c.lerp(cRock, smooth(0.16, 0.34, slope));
+  c.lerp(cRock, smooth(45, 70, h) * 0.6);
+  const sn = snowMask(x, z, h) * (1 - smooth(0.4, 0.6, slope) * 0.7);
+  c.lerp(cSnow, sn);
+  let mm = 0;
+  for (const m of MEADOWS) { const dx = x - m.x; if (dx > m.r + 14 || dx < -m.r - 14) continue; mm = Math.max(mm, 1 - smooth(m.r, m.r + 14, Math.hypot(dx, z - m.z))); }
+  c.lerp(cMeadow, mm * 0.85 * (1 - sn));
+  if (Math.max(Math.abs(x), Math.abs(z)) > 700) c.lerp(cPlain, (1 - smooth(4, 16, h)) * (1 - sn) * 0.7);      // зелені рівнини
+  if (z < -175 && z > -720) { const lat = Math.abs(x - pathX(-z - 180)); c.lerp(cDirt, (1 - smooth(6, 12, lat)) * 0.9); }
+  for (const l of LAKES) {
+    const dd = Math.hypot(x - l.x, z - l.z);
+    if (dd > l.r + 62) continue;
+    const rel = h - l.level;
+    const base = l.beach ? cSand : cGravel;
+    const sandW = (1 - smooth(l.r + 6, l.r + (l.beach ? 60 : 24), dd)) * (1 - smooth(1.8, l.beach ? 3.6 : 2.4, rel));
+    c.lerp(base, sandW * (l.beach ? 1 : 0.7));
+    if (rel < 0.4) { c.copy(base).lerp(cBed, smooth(0, 4, -rel)); if (rel > 0) c.multiplyScalar(0.8); }
+  }
+  for (const rv of RIVERS) {
+    if (x < rv.x0 || x > rv.x1 || z < rv.z0 || z > rv.z1 || insideLake(x, z, 2)) continue;
+    riverQuery(rv, x, z);
+    if (_rqD < 9) { c.lerp(cGravel, 1 - smooth(4, 9, _rqD)); if (_rqD < RIVER_HALF) c.lerp(cBed, (1 - smooth(2, RIVER_HALF, _rqD)) * 0.7); }
+  }
+  const rdist = roadDistAt(x, z);
+  if (rdist < 10) c.lerp(cGravel, (1 - smooth(6.5, 10, rdist)) * 0.6);
+  c.multiplyScalar(0.88 + vnoise(x / 6, z / 6) * 0.24);
+  return c;
+}
+
+function buildChunk(cx, cz, seg) {
+  const x0 = -WORLD_HALF + cx * CS, z0 = -WORLD_HALF + cz * CS, step = CS / seg, n = seg + 1, e = Math.max(1.5, step * 0.5);
+  const nv = n * n + 4 * n, pos = new Float32Array(nv * 3), nor = new Float32Array(nv * 3), col = new Float32Array(nv * 3), uv = new Float32Array(nv * 2);
+  const c = new THREE.Color(), depth = seg > 30 ? 5 : 14;
+  for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+    const k = j * n + i, x = x0 + i * step, z = z0 + j * step, h = H(x, z);
+    let nx = H(x - e, z) - H(x + e, z), nz = H(x, z - e) - H(x, z + e), ny = 2 * e;
+    const l = Math.hypot(nx, ny, nz); nx /= l; ny /= l; nz /= l;
+    terrainColorAt(x, z, h, 1 - ny, c);
+    pos[k * 3] = x; pos[k * 3 + 1] = h - 0.13 * (1 - smooth(185, 200, Math.max(Math.abs(x), Math.abs(z)))); pos[k * 3 + 2] = z;
+    nor[k * 3] = nx; nor[k * 3 + 1] = ny; nor[k * 3 + 2] = nz;
+    col[k * 3] = c.r; col[k * 3 + 1] = c.g; col[k * 3 + 2] = c.b;
+    uv[k * 2] = x / 9; uv[k * 2 + 1] = z / 9;
+  }
+  const idx = [];
+  for (let j = 0; j < seg; j++) for (let i = 0; i < seg; i++) { const a = j * n + i, b = a + 1, cc = a + n, d = cc + 1; idx.push(a, cc, b, b, cc, d); }
+  // «спідниці» по краях, щоб між шматками різної деталізації не було щілин
+  const edges = [[], [], [], []];
+  for (let i = 0; i < n; i++) { edges[0].push(i); edges[1].push(seg * n + i); edges[2].push(i * n); edges[3].push(i * n + seg); }
+  let nb = n * n;
+  for (const E of edges) {
+    const base = nb;
+    for (const t of E) {
+      pos[nb * 3] = pos[t * 3]; pos[nb * 3 + 1] = pos[t * 3 + 1] - depth; pos[nb * 3 + 2] = pos[t * 3 + 2];
+      nor[nb * 3] = nor[t * 3]; nor[nb * 3 + 1] = nor[t * 3 + 1]; nor[nb * 3 + 2] = nor[t * 3 + 2];
+      col[nb * 3] = col[t * 3]; col[nb * 3 + 1] = col[t * 3 + 1]; col[nb * 3 + 2] = col[t * 3 + 2];
+      uv[nb * 2] = uv[t * 2]; uv[nb * 2 + 1] = uv[t * 2 + 1];
+      nb++;
+    }
+    for (let q = 0; q < E.length - 1; q++) { const t0 = E[q], t1 = E[q + 1], b0 = base + q, b1 = base + q + 1; idx.push(t0, b0, t1, t1, b0, b1); }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  g.computeBoundingSphere();
+  const mesh = new THREE.Mesh(g, terrainMat);
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  return mesh;
+}
+
+// lod: 0 — нема, 1 — далекий (12×12), 2 — близький (48×48)
+function updateTerrain(px, pz, budgetMs) {
+  const t0 = performance.now(), want = [];
+  for (let cz = 0; cz < NCH; cz++) for (let cx = 0; cx < NCH; cx++) {
+    const mx = -WORLD_HALF + cx * CS, mz = -WORLD_HALF + cz * CS;
+    const dx = Math.max(mx - px, 0, px - (mx + CS)), dz = Math.max(mz - pz, 0, pz - (mz + CS)), d = Math.hypot(dx, dz);
+    const key = cz * NCH + cx, cur = terrainChunks.get(key), curLod = cur ? cur.lod : 0;
+    let lod = d < (curLod === 2 ? 520 : 420) ? 2 : d < (curLod ? 1250 : 1100) ? 1 : 0;
+    if (lod === curLod) continue;
+    want.push({ cx, cz, key, lod, d, cur });
+  }
+  want.sort((a, b) => (a.lod === 0 ? -1 : 0) - (b.lod === 0 ? -1 : 0) || a.d - b.d);
+  for (const w of want) {
+    if (w.lod !== 0 && performance.now() - t0 > budgetMs) break;
+    if (w.cur) { scene.remove(w.cur.mesh); w.cur.mesh.geometry.dispose(); terrainChunks.delete(w.key); }
+    if (w.lod) terrainChunks.set(w.key, { lod: w.lod, mesh: buildChunk(w.cx, w.cz, w.lod === 2 ? 48 : 12) });
+  }
+}
+
 function buildTerrain() {
-  const SIZE = WORLD_HALF * 2, SEG = 360;
-  const geo = new THREE.PlaneGeometry(SIZE, SIZE, SEG, SEG);
-  geo.rotateX(-Math.PI / 2);
-  const pos = geo.attributes.position;
-  const hs = new Float32Array(pos.count);
-  for (let i = 0; i < pos.count; i++) {
-    const x = pos.getX(i), z = pos.getZ(i), h0 = H(x, z);
-    hs[i] = h0;
-    pos.setY(i, h0 - 0.13 * (1 - smooth(185, 200, Math.max(Math.abs(x), Math.abs(z)))));   // всередині міста нижче доріг
-  }
-  geo.computeVertexNormals();
-  scaleUV(geo, SIZE / 9, SIZE / 9);
-
-  const nor = geo.attributes.normal;
-  const colors = new Float32Array(pos.count * 3);
-  const cGrass = new THREE.Color(0x54733f), cMeadow = new THREE.Color(0x73a04a), cForest = new THREE.Color(0x3b5636);
-  const cRock = new THREE.Color(0x7c776e), cSnow = new THREE.Color(0xf3f7fb), cDirt = new THREE.Color(0x6c5b44);
-  const cSand = new THREE.Color(0xe0cf9f), cGravel = new THREE.Color(0x8b857a), cBed = new THREE.Color(0x3d5b57);
-  const c = new THREE.Color();
-  for (let i = 0; i < pos.count; i++) {
-    const x = pos.getX(i), z = pos.getZ(i), h = hs[i];
-    const slope = 1 - nor.getY(i);
-    c.copy(cGrass);
-    c.lerp(cForest, smooth(3, 35, h) * 0.8);
-    c.lerp(cRock, smooth(0.16, 0.34, slope));
-    c.lerp(cRock, smooth(45, 70, h) * 0.6);
-    let sn = snowMask(x, z, h) * (1 - smooth(0.4, 0.6, slope) * 0.7);
-    c.lerp(cSnow, sn);
-    let mm = 0;
-    for (const m of MEADOWS) mm = Math.max(mm, 1 - smooth(m.r, m.r + 14, Math.hypot(x - m.x, z - m.z)));
-    c.lerp(cMeadow, mm * 0.85 * (1 - sn));
-    if (z < -175) { const lat = Math.abs(x - pathX(-z - 180)); c.lerp(cDirt, (1 - smooth(6, 12, lat)) * 0.9); }
-    for (const l of LAKES) {
-      const dd = Math.hypot(x - l.x, z - l.z);
-      if (dd > l.r + 62) continue;
-      const rel = h - l.level;
-      const base = l.beach ? cSand : cGravel;
-      const sandW = (1 - smooth(l.r + 6, l.r + (l.beach ? 60 : 24), dd)) * (1 - smooth(1.8, l.beach ? 3.6 : 2.4, rel));
-      c.lerp(base, sandW * (l.beach ? 1 : 0.7));
-      if (rel < 0.4) { c.copy(base).lerp(cBed, smooth(0, 4, -rel)); if (rel > 0) c.multiplyScalar(0.8); }
-    }
-    for (const rv of RIVERS) {
-      if (x < rv.x0 || x > rv.x1 || z < rv.z0 || z > rv.z1 || insideLake(x, z, 2)) continue;
-      riverQuery(rv, x, z);
-      if (_rqD < 9) { c.lerp(cGravel, 1 - smooth(4, 9, _rqD)); if (_rqD < RIVER_HALF) c.lerp(cBed, (1 - smooth(2, RIVER_HALF, _rqD)) * 0.7); }
-    }
-    const rdist = roadDistAt(x, z);
-    if (rdist < 10) c.lerp(cGravel, (1 - smooth(6.5, 10, rdist)) * 0.6);
-    c.multiplyScalar(0.88 + vnoise(x / 6, z / 6) * 0.24);
-    colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b;
-  }
-  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  const terrain = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ vertexColors: true, map: groundTex, roughness: 1 }));
-  terrain.receiveShadow = true; terrain.frustumCulled = false;
-  scene.add(terrain);
-
+  updateTerrain(0, 6, Infinity);
   // асфальтова стрічка гірської дороги з розміткою
   const pts = [];
   for (let s = 12; s <= 520; s += 2) {
@@ -777,20 +855,21 @@ function buildTerrain() {
 
 const pines = {};
 function makePines() {
-  const TOTAL = 1600, rnd = mulberry(99);
+  const TOTAL = 7000, rnd = mulberry(99);
   const list = [];
-  for (let tries = 0; tries < 20000 && list.length < TOTAL; tries++) {
+  for (let tries = 0; tries < 80000 && list.length < TOTAL; tries++) {
     const x = (rnd() * 2 - 1) * (WORLD_HALF - 20), z = (rnd() * 2 - 1) * (WORLD_HALF - 20);
     if (Math.abs(x) < 195 && Math.abs(z) < 195) continue;
+    if (fbm(x / 90 + 40, z / 90 + 12, 3) < 0.46) continue;
     if (MEADOWS.some(m => Math.hypot(x - m.x, z - m.z) < m.r + 8)) continue;
+    if (FARMFIELDS.some(f => Math.hypot(x - f.x, z - f.z) < 90)) continue;
     if (nearWater(x, z)) continue;
     if (SITES.some(m => Math.hypot(x - m.x, z - m.z) < m.r + 12) || roadDistAt(x, z) < 14) continue;
     if (z < -170 && Math.abs(x - pathX(-z - 180)) < 14) continue;
     const h = H(x, z);
-    if (h < 1 || h > 64) continue;
+    if (h < 0.3 || h > 64) continue;
     const gx = Math.abs(H(x + 2, z) - H(x - 2, z)) / 4, gz = Math.abs(H(x, z + 2) - H(x, z - 2)) / 4;
     if (Math.hypot(gx, gz) > 0.9) continue;
-    if (fbm(x / 90 + 40, z / 90 + 12, 3) < 0.46) continue;
     if (h > 45 && rnd() < (h - 45) / 25) continue;
     list.push({ x, z, h, s: 0.8 + rnd() * 0.9 });
   }
@@ -1162,7 +1241,7 @@ function spawnAnimals() {
       a.g.position.set(x, H(x, z), z);
       scene.add(a.g);
       animals.push({
-        g: a.g, legs: a.legs, meadow: m, x, z, heading: rnd() * 6.28, speed: 0, walk: a.walk * (0.8 + rnd() * 0.4), run: a.run,
+        g: a.g, qvis: true, legs: a.legs, meadow: m, x, z, heading: rnd() * 6.28, speed: 0, walk: a.walk * (0.8 + rnd() * 0.4), run: a.run,
         tx: x, tz: z, hasTarget: false, wait: rnd() * 4, phase: rnd() * 6, rank: k / list.length
       });
     });
@@ -1172,8 +1251,9 @@ function spawnAnimals() {
 const LEG_PHASE = [0, Math.PI, Math.PI, 0];
 function updateAnimals(dt, carX, carZ, carSpeed) {
   for (const a of animals) {
-    if (!a.g.visible) continue;
+    if (!a.qvis) { a.g.visible = false; continue; }
     const dxc = a.x - carX, dzc = a.z - carZ, dc = Math.hypot(dxc, dzc);
+    a.g.visible = dc < 300;
     if (dc > 260) continue;
     const m = a.meadow;
     const scared = dc < 9 || (dc < 22 && carSpeed > 3);
@@ -1460,7 +1540,7 @@ const rockBalls = [];
 function makeStones() {
   const list = generateStones();
   for (const st of list) addStone(st);
-  const im = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1, 1), new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, flatShading: true }), list.length);
+  const im = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1, 0), new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, flatShading: true }), list.length);
   const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler(), p = new V3(), sc = new V3(), col = new THREE.Color(), rnd = mulberry(99);
   list.forEach((st, i) => {
     const h0 = H(st.x, st.z);
@@ -1766,7 +1846,11 @@ function updateCar(dt) {
   // кузов на пружинах: підвіска, перекіс і підйом коліс на нерівностях
   wheelGround(p.x, p.z, fwd, rightV);
   if (!susp.init) { susp.init = true; susp.y = (GH[0] + GH[1] + GH[2] + GH[3]) / 4; }
+  const vy0 = susp.vy;
   stepSusp(susp, GH, dt);
+  const dvy = Math.abs(susp.vy - vy0);
+  if (dvy > 1.8 && Math.abs(fs) > 2 && audioState.cd <= 0) { audio.thump(Math.min(1, dvy / 5)); audioState.cd = 0.2; }
+  audioState.cd -= dt;
   const groundY = (HH[0] + HH[1] + HH[2] + HH[3]) / 4;
   carMesh.position.set(p.x, susp.y, p.z);
   carMesh.quaternion.copy(yawQuat).multiply(_qp.setFromAxisAngle(AX, susp.p)).multiply(_qr.setFromAxisAngle(AZ, susp.r));
@@ -1787,9 +1871,10 @@ function updateCar(dt) {
   speedEl.textContent = String(speedKmh);
   gearEl.textContent = fs < -0.3 || (input.reverse && speedKmh < 2) ? 'R' : (speedKmh < 2 ? 'N' : 'D');
 
-  const alt = Math.round(groundY);
-  const key = alt + '|' + Math.round(dirt * 100) + '|' + (washing ? 1 : 0);
-  if (key !== statusKey) { statusKey = key; statusEl.textContent = `JEEP · ${alt} м · БРУД ${Math.round(dirt * 100)}%${washing ? ' · МИЙКА' : ''}`; }
+  Object.assign(audioState, { fs, throttle: (input.gas || input.reverse) ? 1 : 0, brake: input.brake, surf, lat, rough, wading: surf === SURF_WATER });
+  const alt = Math.round(groundY), gx = Math.round(p.x / 10) * 10, gz = Math.round(p.z / 10) * 10;
+  const key = alt + '|' + Math.round(dirt * 100) + '|' + (washing ? 1 : 0) + '|' + gx + '|' + gz;
+  if (key !== statusKey) { statusKey = key; statusEl.textContent = `JEEP · ${alt} м · БРУД ${Math.round(dirt * 100)}%${washing ? ' · МИЙКА' : ''} · X ${gx} Z ${gz}`; }
   return { x: p.x, z: p.z, speed: Math.hypot(v2.x, v2.z), fs };
 }
 
@@ -1827,7 +1912,7 @@ const SNOW_FOG = new THREE.Color(0xcdd6dc), SKY_TOP_CLEAR = new THREE.Color(0x4f
 let snowTime = 0;
 function updateWeather(dt, cx, cz) {
   const d = Math.max(Math.abs(cx), Math.abs(cz));
-  const target = smooth(205, 280, d);
+  const target = Math.max(smooth(205, 280, d) * (1 - smooth(650, 760, d)), smooth(35, 65, H(cx, cz)) * smooth(620, 760, d));
   snowAmt += (target - snowAmt) * (1 - Math.exp(-0.8 * dt));
   scene.fog.color.copy(HORIZON).lerp(SNOW_FOG, snowAmt);
   skyUniforms.uTop.value.copy(SKY_TOP_CLEAR).lerp(SKY_TOP_SNOW, snowAmt);
@@ -1874,9 +1959,11 @@ function updateCamera(dt, cx, cz) {
 }
 
 const clock = new THREE.Clock();
+const _wd = new V3();
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), .05);
+  if (inMenu) { audioState.inMenu = true; audio.update(dt, audioState); }
   if (inMenu && menuView) {
     menuView.update(dt, clock.elapsedTime);
     renderer.render(menuView.scene, menuView.camera);
@@ -1886,6 +1973,11 @@ function animate() {
     const c = updateCar(dt);
     updateRemotes(dt);
     sendNetState(dt, c);
+    if (veg) veg.update(dt, clock.elapsedTime, c.x, c.z);
+    terrainT += dt; if (terrainT > 0.12) { terrainT = 0; updateTerrain(c.x, c.z, 6); }
+    playersT += dt; if (playersT > 1) { playersT = 0; if (mpActive) renderPlayers(); }
+    audioState.inMenu = false; audio.update(dt, audioState);
+    camera.getWorldDirection(_wd); audio.setListener(camera.position.x, camera.position.y, camera.position.z, _wd.x, _wd.y, _wd.z);
     updateTraffic(dt);
     updateTraffic2(dt);
     for (const f of worldUpdates) f(dt, clock.elapsedTime);
@@ -1912,7 +2004,8 @@ function applyQuality() {
     const n = Math.floor(pines.total * q.trees);
     for (const k of ['trunk', 'c1', 'c2']) { pines[k].count = n; pines[k].castShadow = q.castTrees; }
   }
-  animals.forEach(a => { a.g.visible = a.rank < q.animals; });
+  animals.forEach(a => { a.qvis = a.rank < q.animals; });
+  if (veg) veg.setQuality(q.grass);
   refreshQualityUI();
 }
 
@@ -1972,7 +2065,12 @@ function bindControls() {
   document.querySelector('#gearBtn').addEventListener('click', () => settingsEl.classList.remove('hidden'));
   document.querySelector('#closeSettings').addEventListener('click', () => settingsEl.classList.add('hidden'));
   settingsEl.addEventListener('click', e => { if (e.target === settingsEl) settingsEl.classList.add('hidden'); });
-  document.querySelector('#playBtn').addEventListener('click', () => setMenu(false));
+  document.querySelector('#playBtn').addEventListener('click', () => { audio.resume(); setMenu(false); });
+  document.querySelectorAll('#soundSeg button').forEach(b => b.addEventListener('click', () => {
+    soundOn = b.dataset.s === '1'; audio.setEnabled(soundOn); if (soundOn) audio.resume();
+    try { localStorage.setItem('pd_sound', soundOn ? '1' : '0'); } catch (e) { /* ignore */ }
+    refreshQualityUI();
+  }));
   menuBtn.addEventListener('click', () => { if (mpActive) endSession(); setMenu(true); });
   bindMultiplayerUI();
   // кнопка «Мультиплеєр (P2P)» поки без функціоналу
@@ -2023,11 +2121,13 @@ function openMP() {
   net.connect().then(() => renderServers(net.serverList())).catch(() => { mpErrEl.textContent = 'Немає зв’язку з мережею. Перевірте інтернет.'; });
 }
 function joinServer(id) {
+  audio.resume();
   mpErrEl.textContent = ''; setBusy(true);
   try { localStorage.setItem('pd_nick', getNick()); } catch (e) { /* ignore */ }
   net.join(id, getNick()).catch(() => { mpErrEl.textContent = 'Не вдалося підключитися'; setBusy(false); });
 }
 function createServer() {
+  audio.resume();
   mpErrEl.textContent = ''; setBusy(true);
   const name = document.querySelector('#srvName').value.trim() || (getNick() + ' — сервер');
   try { localStorage.setItem('pd_nick', getNick()); } catch (e) { /* ignore */ }
@@ -2053,30 +2153,44 @@ function startSession(info) {
 }
 function syncRoster(players) {
   const ids = new Set(players.map(p => p.id));
-  for (const [id, r] of remotes) if (!ids.has(id)) { scene.remove(r.group); remotes.delete(id); }
+  for (const [id, r] of remotes) if (!ids.has(id)) { scene.remove(r.group); remotes.delete(id); audio.syncRemote(id, false); }
+  lastRoster = players;
   for (const p of players) {
     if (p.id === net.id || remotes.has(p.id)) continue;
     const j = buildJeep(SLOT_COLORS[p.slot % SLOT_COLORS.length]);
-    j.group.add(makeNameTag(p.nick)); j.group.visible = false; scene.add(j.group);
-    remotes.set(p.id, { ...j, has: false, cur: { x: 0, y: 0, z: 0, yaw: 0, p: 0, r: 0 }, tgt: null });
+    const tag = makeNameTag(p.nick, 0); j.group.add(tag); j.group.visible = false; scene.add(j.group); audio.syncRemote(p.id, true);
+    remotes.set(p.id, { ...j, id: p.id, tag, nick: p.nick, baseColor: new THREE.Color(SLOT_COLORS[p.slot % SLOT_COLORS.length]), dirt: 0, dShown: 0, has: false, cur: { x: 0, y: 0, z: 0, yaw: 0, p: 0, r: 0 }, tgt: null });
   }
+  renderPlayers();
+}
+let lastRoster = [];
+function renderPlayers() {
   playersEl.style.display = mpActive || net.role ? 'block' : 'none';
   playersEl.innerHTML = '';
-  for (const p of players) {
-    const d = document.createElement('div');
+  for (const p of lastRoster) {
+    const d = document.createElement('div'), me = p.id === net.id, r = remotes.get(p.id);
+    const dv = me ? dirt : (r ? r.dirt : 0);
     const dot = document.createElement('span'); dot.className = 'dot'; dot.style.background = '#' + SLOT_COLORS[p.slot % SLOT_COLORS.length].toString(16).padStart(6, '0');
-    d.append(dot, document.createTextNode(p.nick + (p.id === net.id ? ' (ви)' : '') + (p.slot === 0 ? ' ★' : '')));
+    d.append(dot, document.createTextNode(p.nick + (me ? ' (ви)' : '') + (p.slot === 0 ? ' ★' : '') + ' · бруд ' + Math.round(dv * 100) + '%'));
     playersEl.appendChild(d);
   }
 }
 function applyRemoteState(m) {
   const r = remotes.get(m.id); if (!r) return;
   r.tgt = m;
+  if (typeof m.d === 'number') {
+    r.dirt = m.d;
+    if (Math.abs(m.d - r.dShown) >= 0.02) {
+      r.dShown = m.d; const k = smooth(0, 1, m.d);
+      r.bodyMat.color.copy(r.baseColor).lerp(C_BODY1, k * 0.8); r.bodyMat.roughness = mix(0.4, 0.88, k); r.bodyMat.clearcoat = mix(1, 0.12, k);
+      r.tireMat.color.copy(C_TIRE0).lerp(C_TIRE1, k); r.tag.userData.redraw(m.d);
+    }
+  }
   if (!r.has) { Object.assign(r.cur, { x: m.x, y: m.y, z: m.z, yaw: m.yaw, p: m.p, r: m.r }); r.has = true; r.group.visible = true; }
 }
 function endSession() {
   mpActive = false; net.leave();
-  for (const r of remotes.values()) scene.remove(r.group);
+  for (const r of remotes.values()) { scene.remove(r.group); audio.syncRemote(r.id, false); }
   remotes.clear(); playersEl.style.display = 'none';
 }
 const _rq1 = new THREE.Quaternion(), _rq2 = new THREE.Quaternion(), _rq3 = new THREE.Quaternion();
@@ -2092,6 +2206,7 @@ function updateRemotes(dt) {
     r.group.quaternion.setFromAxisAngle(Y_AXIS, c.yaw).multiply(_rq2.setFromAxisAngle(AX, c.p)).multiply(_rq3.setFromAxisAngle(AZ, c.r));
     for (const s of r.spinners) s.rotation.x -= (t.fs || 0) * dt / WHEEL_R;
     for (const f of r.frontPivots) f.rotation.y = (t.st || 0) * 0.5;
+    audio.updateRemote(r.id, c.x, c.y, c.z, t.fs || 0);
   }
 }
 function sendNetState(dt, c) {
@@ -2100,7 +2215,19 @@ function sendNetState(dt, c) {
   if (netT < 0.05) return;
   netT = 0;
   const rr = carBody.rotation(), q = v => Math.round(v * 100) / 100;
-  net.sendState({ x: q(c.x), y: q(carMesh.position.y), z: q(c.z), yaw: q(2 * Math.atan2(rr.y, rr.w)), p: q(susp.p), r: q(susp.r), st: q(steerVal), fs: q(c.fs) });
+  net.sendState({ x: q(c.x), y: q(carMesh.position.y), z: q(c.z), yaw: q(2 * Math.atan2(rr.y, rr.w)), p: q(susp.p), r: q(susp.r), st: q(steerVal), fs: q(c.fs), d: q(dirt) });
+}
+
+function grassOK(x, z) {
+  if (inCitySquares(x, z) && Math.hypot(x, z) > 17) return null;
+  for (let i = 0; i < grassCover.length; i++) { const r = grassCover[i]; if (x > r.x0 && x < r.x1 && z > r.z0 && z < r.z1) return null; }
+  if (roadDistAt(x, z) < ROAD_HALF_W + 1.2) return null;
+  if (z < -175 && z > -720 && Math.abs(x - pathX(-z - 180)) < 8) return null;
+  if (waterDepthAt(x, z) > 0 || sandAt(x, z)) return null;
+  const h = H(x, z);
+  if (h > 62 || snowMask(x, z, h) > 0.3) return null;
+  if (Math.hypot(H(x + 1.5, z) - h, H(x, z + 1.5) - h) / 1.5 > 0.85) return null;
+  return h;
 }
 
 const QNOTE = {
@@ -2109,6 +2236,7 @@ const QNOTE = {
   low: 'Максимальна швидкість: тіні 1024, мало дерев і тварин, чіткість 1×. Для слабких пристроїв.'
 };
 function refreshQualityUI() {
+  document.querySelectorAll('#soundSeg button').forEach(b => b.classList.toggle('on', (b.dataset.s === '1') === soundOn));
   document.querySelectorAll('#qualitySeg button').forEach(b => b.classList.toggle('on', b.dataset.q === qualityKey));
   const n = document.querySelector('#qualityNote'); if (n) n.textContent = QNOTE[qualityKey];
 }
@@ -2149,9 +2277,16 @@ async function start() {
     carWash = c2.wash; worldUpdates.push(...c2.update); addTraffic2(c2.traffic);
   });
   safe('farm', () => { const f = buildFarm(w2); worldUpdates.push(...f.update); });
+  safe('veg', () => {
+    veg = createVegetation({ scene, H, grassOK, mulberry, addBumpRect, cover: grassCover });
+    grassCover.push({ x0: FARM.x - FARM_YARD.w / 2, x1: FARM.x + FARM_YARD.w / 2, z0: FARM.z - FARM_YARD.d / 2, z1: FARM.z + FARM_YARD.d / 2 });
+    for (const f of FARM_FIELDS) veg.addCrop({ x0: FARM.x + f.cx - f.w / 2, x1: FARM.x + f.cx + f.w / 2, z0: FARM.z + f.cz - f.d / 2, z1: FARM.z + f.cz + f.d / 2 }, f.kind, 2.2);
+    veg.buildFarmland(FARMFIELDS);
+  });
   makePines(); makeBeach(); makeRocks(); safe('stones', makeStones); makeMist(); makeSnow(); makeCar(); addTraffic(); spawnAnimals(); makeTracks();
   menuView = safe('menu', () => createMenuScene(scene.environment));
   bindControls(); applyQuality(); setMenu(true);
+  if (veg) veg.update(0, 0, 0, 6);
   await initPhysics();
   ready = true;
   loading.style.opacity = '0';

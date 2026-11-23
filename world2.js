@@ -1,6 +1,12 @@
 // Нове місто, ферма та меші доріг. Усе будується один раз під час старту.
 import * as THREE from 'three';
 
+export const FARM_FIELDS = [
+  { cx: -62, cz: 48, w: 72, d: 46, kind: 'crop' },
+  { cx: -72, cz: -50, w: 66, d: 44, kind: 'wheat' },
+  { cx: 65, cz: 110, w: 60, d: 50, kind: 'sunflower' }
+];
+export const FARM_YARD = { cx: 0, cz: 0, w: 76, d: 62 };
 const V3 = THREE.Vector3;
 const m4 = new THREE.Matrix4(), q4 = new THREE.Quaternion(), p4 = new V3(), s4 = new V3(), e4 = new THREE.Euler();
 
@@ -468,12 +474,7 @@ export function buildFarm(ctx) {
     const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8;
     return t;
   };
-  const fields = [
-    { cx: -62, cz: 48, w: 72, d: 46, kind: 'crop' },
-    { cx: -72, cz: -50, w: 66, d: 44, kind: 'wheat' },
-    { cx: 65, cz: 110, w: 60, d: 50, kind: 'sunflower' }
-  ];
-  for (const f of fields) {
+  for (const f of FARM_FIELDS) {
     const geo = new THREE.PlaneGeometry(f.w, f.d); geo.rotateX(-Math.PI / 2); scaleUV(geo, f.w / 6, f.d / 6);
     const m = new THREE.Mesh(geo, poly(new THREE.MeshStandardMaterial({ map: rowsTex(f.kind), roughness: 1 })));
     m.position.set(wx(f.cx), 0.04, wz(f.cz)); m.receiveShadow = true; scene.add(m);

@@ -72,18 +72,27 @@ export function buildJeep(color = 0x4b6b2e) {
     const r = new THREE.Mesh(new THREE.CylinderGeometry(0.27, 0.27, 0.34, 12), rim); r.rotation.z = Math.PI / 2; spin.add(r);
     g.add(pivot); spinners.push(spin); if (front) frontPivots.push(pivot);
   }
-  return { group: g, spinners, frontPivots, bodyMat: body };
+  return { group: g, spinners, frontPivots, bodyMat: body, tireMat: tire };
 }
 
-// табличка з ніком над машиною
-export function makeNameTag(text) {
-  const c = document.createElement('canvas'); c.width = 256; c.height = 64;
+// табличка з ніком і рівнем бруду над машиною
+export function makeNameTag(text, dirt = 0) {
+  const c = document.createElement('canvas'); c.width = 256; c.height = 84;
   const x = c.getContext('2d');
-  x.fillStyle = 'rgba(10,14,18,0.62)'; x.beginPath(); x.roundRect(4, 6, 248, 52, 14); x.fill();
-  x.fillStyle = '#ffffff'; x.font = 'bold 30px Arial'; x.textAlign = 'center'; x.textBaseline = 'middle';
-  x.fillText(text, 128, 33, 230);
   const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const draw = (d) => {
+    x.clearRect(0, 0, 256, 84);
+    x.fillStyle = 'rgba(10,14,18,0.66)'; x.beginPath(); x.roundRect(4, 4, 248, 76, 14); x.fill();
+    x.fillStyle = '#ffffff'; x.font = 'bold 30px Arial'; x.textAlign = 'center'; x.textBaseline = 'middle';
+    x.fillText(text, 128, 28, 230);
+    x.fillStyle = 'rgba(255,255,255,0.18)'; x.beginPath(); x.roundRect(20, 54, 216, 12, 6); x.fill();
+    x.fillStyle = '#b07a3c'; x.beginPath(); x.roundRect(20, 54, Math.max(10, 216 * d), 12, 6); x.fill();
+    x.fillStyle = '#e7dcc8'; x.font = 'bold 13px Arial'; x.textAlign = 'left'; x.fillText('БРУД ' + Math.round(d * 100) + '%', 22, 48);
+    tex.needsUpdate = true;
+  };
+  draw(dirt);
   const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }));
-  sp.scale.set(3.4, 0.85, 1); sp.position.y = 3.1; sp.renderOrder = 5;
+  sp.scale.set(3.4, 1.12, 1); sp.position.y = 3.2; sp.renderOrder = 5;
+  sp.userData.redraw = draw;
   return sp;
 }
